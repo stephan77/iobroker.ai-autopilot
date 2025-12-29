@@ -254,18 +254,17 @@ class AiAutopilot extends utils.Adapter {
       const historyData = await this.collectHistoryData();
       const aggregates = this.aggregateData(historyData);
       const context = await this.buildContext(liveData, aggregates);
-      const energySummary = this.buildEnergySummary(context.live.energy);
-      const recommendations = this.generateRecommendations(liveData, aggregates, energySummary);
-      if (this.config.debug) {
-        this.log.info(`[DEBUG] Context built: ${JSON.stringify(this.redactContext(context))}`);
-      }
-
       if (context.live.energy.length === 0) {
         const message = 'No energy sources configured – analysis skipped.';
         await this.setStateAsync('report.last', message, true);
         await this.setStateAsync('report.actions', JSON.stringify([], null, 2), true);
         await this.setStateAsync('info.lastError', '', true);
         return;
+      }
+      const energySummary = this.buildEnergySummary(context.live.energy);
+      const recommendations = this.generateRecommendations(liveData, aggregates, energySummary);
+      if (this.config.debug) {
+        this.log.info(`[DEBUG] Context built: ${JSON.stringify(this.redactContext(context))}`);
       }
 
       let gptInsights = null;
@@ -968,7 +967,7 @@ class AiAutopilot extends utils.Adapter {
         .map((entry) => Number(entry.value))
         .filter((value) => Number.isFinite(value));
       if (values.length === 0) {
-        return null;
+        return 0;
       }
       return values.reduce((sum, value) => sum + value, 0);
     };
