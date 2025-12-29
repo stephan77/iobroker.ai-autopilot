@@ -22,16 +22,46 @@
       "instance": "telegram.0",
       "chatId": ""
     },
-    "history": {
-      "influx": {
-        "enabled": false
-      },
-      "mysql": {
-        "enabled": false
-      }
+    "energy": {
+      "houseConsumption": "",
+      "gridPower": "",
+      "batterySoc": "",
+      "batteryPower": "",
+      "wallbox": ""
     },
     "pvSources": [],
+    "consumers": [],
+    "rooms": [],
     "heaters": [],
-    "consumers": []
+    "temperature": {
+      "outside": "",
+      "weather": "",
+      "frostRisk": ""
+    },
+    "windowContacts": [],
+    "water": {
+      "total": "",
+      "daily": "",
+      "hotWater": "",
+      "boilerTemp": "",
+      "circulation": ""
+    },
+    "leakSensors": [],
+    "history": {
+      "influx": {
+        "enabled": false,
+        "instance": "influxdb.0",
+        "periodHours": 24,
+        "resolutionMin": 15,
+        "datapoints": []
+      },
+      "mysql": {
+        "enabled": false,
+        "instance": "mysql.0",
+        "periodDays": 7,
+        "resolutionMin": 60,
+        "datapoints": []
+      }
+    }
   }
 }
