@@ -219,14 +219,19 @@ class AiAutopilot extends utils.Adapter {
 
     const normalized = feedback.toUpperCase();
     if (normalized === 'JA') {
+      this.updateActionStatuses(this.pendingActions, 'approved');
+      await this.setStateAsync('report.actions', JSON.stringify(this.pendingActions, null, 2), true);
       await this.executeActions(this.pendingActions);
       this.pendingActions = null;
       await this.setStateAsync('memory.feedback', '', true);
     } else if (normalized === 'NEIN') {
+      this.updateActionStatuses(this.pendingActions, 'rejected');
+      await this.setStateAsync('report.actions', JSON.stringify(this.pendingActions, null, 2), true);
       this.log.info('Aktionen wurden abgelehnt.');
       this.pendingActions = null;
       await this.setStateAsync('memory.feedback', '', true);
     } else if (normalized.startsWith('ÄNDERN')) {
+      await this.setStateAsync('memory.feedback', feedback, true);
       this.log.info(`Änderungswunsch: ${feedback}`);
     }
   }
@@ -284,12 +289,8 @@ class AiAutopilot extends utils.Adapter {
       await this.setStateAsync('report.last', reportText, true);
       await this.setStateAsync('report.actions', JSON.stringify(actions, null, 2), true);
 
-      if (actions.length > 0) {
-        if (this.config.dryRun) {
-          await this.sendTelegramMessage('Dry-Run aktiv: Vorschläge liegen vor.', reportText);
-        } else {
-          await this.requestApproval(actions, reportText);
-        }
+      if (actions.length > 0 && !this.config.dryRun) {
+        await this.requestApproval(actions, reportText);
       }
 
       await this.setStateAsync('info.lastError', '', true);
@@ -808,36 +809,44 @@ class AiAutopilot extends utils.Adapter {
     return lines.join('\n');
   }
 
-  buildActions(recommendations, gptInsights) {
-    const actions = recommendations.map((rec) => ({
+  buildActions(recommendations) {
+    const baseId = Date.now();
+    return recommendations.map((rec, index) => ({
+      id: `${baseId}-${index + 1}`,
       category: rec.category,
       description: rec.description,
       priority: rec.priority,
       status: 'proposed'
     }));
-
-    if (gptInsights) {
-      actions.push({
-        category: 'gpt',
-        description: gptInsights,
-        priority: 'info',
-        status: 'analysis'
-      });
-    }
-
-    return actions;
   }
 
   async requestApproval(actions, reportText) {
     this.pendingActions = actions;
+    const approvalText = this.buildApprovalMessage(actions, reportText);
     await this.sendTelegramMessage(
       'Freigabe erforderlich: Antworten mit JA, NEIN oder ÄNDERN: <Text>',
-      reportText
+      approvalText
     );
   }
 
   async executeActions(actions) {
     this.log.info(`Aktionen freigegeben: ${actions.length}`);
+  }
+
+  buildApprovalMessage(actions, reportText) {
+    const lines = ['Freigabe erforderlich. Bitte Antwort senden: JA, NEIN oder ÄNDERN:<Text>', ''];
+    lines.push('Aktionen:');
+    for (const action of actions) {
+      lines.push(`- [${action.priority}] ${action.description}`);
+    }
+    lines.push('', 'Report:', reportText);
+    return lines.join('\n');
+  }
+
+  updateActionStatuses(actions, status) {
+    for (const action of actions) {
+      action.status = status;
+    }
   }
 
   async sendTelegramMessage(subject, reportText) {
