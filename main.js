@@ -24,24 +24,29 @@ class AiAutopilot extends utils.Adapter {
   }
 
   async onReady() {
-    await this.ensureStates();
-    await this.setStateAsync('info.connection', false, true);
-    await this.setStateAsync('info.lastError', '', true);
+    try {
+      await this.ensureStates();
+      await this.setStateAsync('info.lastError', '', true);
 
-    if (this.config.debug) {
-      this.log.info('[DEBUG] Debug logging enabled');
+      if (this.config.debug) {
+        this.log.info('[DEBUG] Debug logging enabled');
+      }
+
+      if (this.config.openaiApiKey) {
+        this.openaiClient = new OpenAI({ apiKey: this.config.openaiApiKey });
+      }
+
+      this.subscribeStates('control.run');
+      this.subscribeStates('memory.feedback');
+
+      this.startScheduler();
+
+      this.log.info('AI Autopilot v0.5.8 ready');
+    } catch (error) {
+      this.handleError('Adapter-Start fehlgeschlagen', error);
+    } finally {
+      await this.setStateAsync('info.connection', true, true);
     }
-
-    if (this.config.openaiApiKey) {
-      this.openaiClient = new OpenAI({ apiKey: this.config.openaiApiKey });
-    }
-
-    this.subscribeStates('control.run');
-    this.subscribeStates('memory.feedback');
-
-    this.startScheduler();
-
-    this.log.info('AI Autopilot v0.5.8 ready');
   }
 
   onUnload(callback) {
@@ -241,8 +246,6 @@ class AiAutopilot extends utils.Adapter {
   }
 
   async runAnalysis(trigger) {
-    await this.setStateAsync('info.connection', true, true);
-
     try {
       if (this.config.debug) {
         this.log.info(`[DEBUG] Config summary: ${JSON.stringify(this.buildConfigSummary())}`);
@@ -250,8 +253,9 @@ class AiAutopilot extends utils.Adapter {
       const liveData = await this.collectLiveData();
       const historyData = await this.collectHistoryData();
       const aggregates = this.aggregateData(historyData);
-      const recommendations = this.generateRecommendations(liveData, aggregates);
       const context = await this.buildContext(liveData, aggregates);
+      const houseConsumption = this.sumHouseConsumption(context.live.energy);
+      const recommendations = this.generateRecommendations(liveData, aggregates, houseConsumption);
       if (this.config.debug) {
         this.log.info(`[DEBUG] Context built: ${JSON.stringify(this.redactContext(context))}`);
       }
@@ -270,7 +274,7 @@ class AiAutopilot extends utils.Adapter {
       } else {
         gptInsights = 'OpenAI not configured - GPT analysis skipped.';
       }
-      const reportText = this.buildReportText(liveData, aggregates, recommendations, gptInsights);
+      const reportText = this.buildReportText(liveData, aggregates, recommendations, gptInsights, houseConsumption);
       const actions = this.buildActions(recommendations, gptInsights);
 
       await this.setStateAsync('report.last', reportText, true);
@@ -287,15 +291,12 @@ class AiAutopilot extends utils.Adapter {
       await this.setStateAsync('info.lastError', '', true);
     } catch (error) {
       this.handleError('Analyse fehlgeschlagen', error);
-    } finally {
-      await this.setStateAsync('info.connection', false, true);
     }
   }
 
   async collectLiveData() {
     const data = {
       energy: {
-        houseConsumption: await this.readNumber(this.config.energy.houseConsumption),
         gridPower: await this.readNumber(this.config.energy.gridPower),
         batterySoc: await this.readNumber(this.config.energy.batterySoc),
         batteryPower: await this.readNumber(this.config.energy.batteryPower),
@@ -638,12 +639,10 @@ class AiAutopilot extends utils.Adapter {
     return aggregated;
   }
 
-  generateRecommendations(liveData, aggregates) {
+  generateRecommendations(liveData, aggregates, houseConsumption) {
     const recommendations = [];
 
     const pvTotal = this.sumTableValues(liveData.pvSources);
-    const houseConsumption =
-      (liveData.energy.houseConsumption || 0) + this.sumTableValues(liveData.energy.additionalSources);
     const gridPower = liveData.energy.gridPower || 0;
 
     if (pvTotal > houseConsumption && gridPower < 0) {
@@ -770,16 +769,14 @@ class AiAutopilot extends utils.Adapter {
     return texts.join('\n');
   }
 
-  buildReportText(liveData, aggregates, recommendations, gptInsights) {
+  buildReportText(liveData, aggregates, recommendations, gptInsights, houseConsumption) {
     const lines = [];
     lines.push(`Trigger: ${new Date().toISOString()}`);
     lines.push(`Modus: ${this.config.mode}`);
     lines.push(`Dry-Run: ${this.config.dryRun}`);
     lines.push(`PV gesamt: ${this.sumTableValues(liveData.pvSources)}`);
     lines.push(`PV Tagesenergie: ${this.sumTableValues(liveData.pvDailySources)}`);
-    lines.push(
-      `Hausverbrauch: ${this.sumTableValues(liveData.energy.additionalSources) + (liveData.energy.houseConsumption ?? 0)}`
-    );
+    lines.push(`Hausverbrauch: ${houseConsumption}`);
     lines.push(`Batterie SOC: ${liveData.energy.batterySoc ?? 'n/a'}`);
     if (liveData.water.hotWater !== null || liveData.water.coldWater !== null) {
       lines.push(`Warmwasser Verbrauch: ${liveData.water.hotWater ?? 'n/a'}`);
@@ -967,6 +964,18 @@ class AiAutopilot extends utils.Adapter {
       return 0;
     }
     return table.reduce((sum, entry) => sum + (Number(entry.value) || 0), 0);
+  }
+
+  sumHouseConsumption(energyEntries) {
+    if (!Array.isArray(energyEntries)) {
+      return 0;
+    }
+    return energyEntries.reduce((sum, entry) => {
+      if (entry && entry.role === 'houseConsumption') {
+        return sum + (Number(entry.value) || 0);
+      }
+      return sum;
+    }, 0);
   }
 
   logDebug(message, payload) {
