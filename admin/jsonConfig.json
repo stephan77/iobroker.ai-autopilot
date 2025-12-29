@@ -13,6 +13,29 @@
           "type": "text",
           "label": "GPT Modell"
         },
+        "mode": {
+          "type": "select",
+          "label": "Modus",
+          "options": [
+            {
+              "label": "manual",
+              "value": "manual"
+            },
+            {
+              "label": "observer",
+              "value": "observer"
+            },
+            {
+              "label": "autopilot",
+              "value": "autopilot"
+            }
+          ]
+        },
+        "intervalMin": {
+          "type": "number",
+          "label": "Analyse-Intervall (Minuten)",
+          "min": 1
+        },
         "debug": {
           "type": "checkbox",
           "label": "Debug Logging aktivieren"
@@ -38,6 +61,415 @@
         "telegram.chatId": {
           "type": "text",
           "label": "Chat ID"
+        }
+      }
+    },
+    "energy": {
+      "type": "tab",
+      "label": "Datenquellen – Energie",
+      "items": {
+        "energy.houseConsumption": {
+          "type": "objectId",
+          "label": "Hausverbrauch (gesamt)",
+          "help": "Summierter Verbrauch aller Haushaltskreise (W)."
+        },
+        "energy.gridPower": {
+          "type": "objectId",
+          "label": "Netzbezug / Einspeisung",
+          "help": "Positiv = Bezug, negativ = Einspeisung (W)."
+        },
+        "energy.batterySoc": {
+          "type": "objectId",
+          "label": "Batterie SOC",
+          "help": "State of Charge der Batterie (%)."
+        },
+        "energy.batteryPower": {
+          "type": "objectId",
+          "label": "Batterie Lade-/Entladeleistung",
+          "help": "Leistung der Batterie (W). Positiv = Laden, negativ = Entladen."
+        },
+        "energy.additionalSources": {
+          "type": "table",
+          "label": "Weitere Stromquellen",
+          "items": [
+            {
+              "attr": "name",
+              "type": "text",
+              "title": "Name"
+            },
+            {
+              "attr": "objectId",
+              "type": "objectId",
+              "title": "Leistung aktuell"
+            },
+            {
+              "attr": "unit",
+              "type": "text",
+              "title": "Einheit"
+            },
+            {
+              "attr": "description",
+              "type": "text",
+              "title": "Beschreibung"
+            }
+          ]
+        },
+        "pvSources": {
+          "type": "table",
+          "label": "PV-Quellen",
+          "items": [
+            {
+              "attr": "name",
+              "type": "text",
+              "title": "Name"
+            },
+            {
+              "attr": "orientation",
+              "type": "text",
+              "title": "Ausrichtung"
+            },
+            {
+              "attr": "objectId",
+              "type": "objectId",
+              "title": "Leistung aktuell"
+            },
+            {
+              "attr": "unit",
+              "type": "text",
+              "title": "Einheit"
+            },
+            {
+              "attr": "description",
+              "type": "text",
+              "title": "Beschreibung"
+            }
+          ]
+        },
+        "pvDailySources": {
+          "type": "table",
+          "label": "PV-Tagesenergie (optional)",
+          "items": [
+            {
+              "attr": "name",
+              "type": "text",
+              "title": "Name"
+            },
+            {
+              "attr": "objectId",
+              "type": "objectId",
+              "title": "Tagesenergie"
+            },
+            {
+              "attr": "unit",
+              "type": "text",
+              "title": "Einheit"
+            },
+            {
+              "attr": "description",
+              "type": "text",
+              "title": "Beschreibung"
+            }
+          ]
+        },
+        "consumers": {
+          "type": "table",
+          "label": "Einzelverbraucher",
+          "items": [
+            {
+              "attr": "name",
+              "type": "text",
+              "title": "Name"
+            },
+            {
+              "attr": "objectId",
+              "type": "objectId",
+              "title": "Leistung aktuell"
+            },
+            {
+              "attr": "dailyObjectId",
+              "type": "objectId",
+              "title": "Tagesverbrauch"
+            },
+            {
+              "attr": "unit",
+              "type": "text",
+              "title": "Einheit"
+            }
+          ]
+        },
+        "energy.wallbox": {
+          "type": "objectId",
+          "label": "E-Auto / Wallbox (optional)",
+          "help": "Leistung der Wallbox oder des E-Autos (W)."
+        }
+      }
+    },
+    "temperature": {
+      "type": "tab",
+      "label": "Datenquellen – Temperatur & Heizung",
+      "items": {
+        "rooms": {
+          "type": "table",
+          "label": "Innenräume",
+          "items": [
+            {
+              "attr": "name",
+              "type": "text",
+              "title": "Raumname"
+            },
+            {
+              "attr": "temperature",
+              "type": "objectId",
+              "title": "Temperatur"
+            },
+            {
+              "attr": "target",
+              "type": "objectId",
+              "title": "Solltemperatur"
+            },
+            {
+              "attr": "heatingPower",
+              "type": "objectId",
+              "title": "Heizleistung"
+            }
+          ]
+        },
+        "heaters": {
+          "type": "table",
+          "label": "Heizungen",
+          "items": [
+            {
+              "attr": "type",
+              "type": "text",
+              "title": "Typ"
+            },
+            {
+              "attr": "objectId",
+              "type": "objectId",
+              "title": "Datenpunkt"
+            },
+            {
+              "attr": "unit",
+              "type": "text",
+              "title": "Einheit"
+            }
+          ]
+        },
+        "temperature.outside": {
+          "type": "objectId",
+          "label": "Außentemperatur"
+        },
+        "temperature.weather": {
+          "type": "objectId",
+          "label": "Wetterdaten (optional)"
+        },
+        "temperature.frostRisk": {
+          "type": "objectId",
+          "label": "Frostgefahr"
+        },
+        "windowContacts": {
+          "type": "table",
+          "label": "Fenster / Türen (optional)",
+          "items": [
+            {
+              "attr": "name",
+              "type": "text",
+              "title": "Name"
+            },
+            {
+              "attr": "objectId",
+              "type": "objectId",
+              "title": "Kontakt"
+            }
+          ]
+        }
+      }
+    },
+    "water": {
+      "type": "tab",
+      "label": "Datenquellen – Wasser",
+      "items": {
+        "water.total": {
+          "type": "objectId",
+          "label": "Wasser Gesamtverbrauch",
+          "help": "Gesamtwasserzähler (m³ oder l)."
+        },
+        "water.daily": {
+          "type": "objectId",
+          "label": "Tagesverbrauch Wasser",
+          "help": "Tagesverbrauch gesamt (m³ oder l)."
+        },
+        "water.hotWater": {
+          "type": "objectId",
+          "label": "Warmwasser Verbrauch",
+          "help": "Verbrauch Warmwasser, z. B. Warmwasserzähler."
+        },
+        "water.coldWater": {
+          "type": "objectId",
+          "label": "Kaltwasser Verbrauch",
+          "help": "Verbrauch Kaltwasser, z. B. Kaltwasserzähler."
+        },
+        "water.boilerTemp": {
+          "type": "objectId",
+          "label": "Boiler / Warmwasserspeicher Temperatur",
+          "help": "Temperatur des Warmwasserspeichers (°C)."
+        },
+        "water.circulation": {
+          "type": "objectId",
+          "label": "Zirkulationspumpe",
+          "help": "Status oder Leistung der Zirkulationspumpe."
+        },
+        "water.additionalSources": {
+          "type": "table",
+          "label": "Weitere Wasserquellen (optional)",
+          "items": [
+            {
+              "attr": "name",
+              "type": "text",
+              "title": "Name"
+            },
+            {
+              "attr": "objectId",
+              "type": "objectId",
+              "title": "Verbrauch"
+            },
+            {
+              "attr": "unit",
+              "type": "text",
+              "title": "Einheit"
+            },
+            {
+              "attr": "description",
+              "type": "text",
+              "title": "Beschreibung"
+            }
+          ]
+        },
+        "water.flowSources": {
+          "type": "table",
+          "label": "Wasserströmung / Durchfluss (optional)",
+          "items": [
+            {
+              "attr": "name",
+              "type": "text",
+              "title": "Name"
+            },
+            {
+              "attr": "objectId",
+              "type": "objectId",
+              "title": "Durchfluss"
+            },
+            {
+              "attr": "unit",
+              "type": "text",
+              "title": "Einheit"
+            },
+            {
+              "attr": "description",
+              "type": "text",
+              "title": "Beschreibung"
+            }
+          ]
+        },
+        "leakSensors": {
+          "type": "table",
+          "label": "Leckage-Sensoren (optional)",
+          "items": [
+            {
+              "attr": "name",
+              "type": "text",
+              "title": "Name"
+            },
+            {
+              "attr": "objectId",
+              "type": "objectId",
+              "title": "Kontakt"
+            }
+          ]
+        }
+      }
+    },
+    "history": {
+      "type": "tab",
+      "label": "Historische Daten",
+      "items": {
+        "history.influx.enabled": {
+          "type": "checkbox",
+          "label": "InfluxDB aktiv"
+        },
+        "history.influx.instance": {
+          "type": "text",
+          "label": "InfluxDB Instanz"
+        },
+        "history.influx.periodHours": {
+          "type": "number",
+          "label": "Zeitraum (Stunden)",
+          "min": 1
+        },
+        "history.influx.resolutionMin": {
+          "type": "number",
+          "label": "Auflösung (Minuten)",
+          "min": 1
+        },
+        "history.influx.datapoints": {
+          "type": "table",
+          "label": "InfluxDB Datenpunkte",
+          "items": [
+            {
+              "attr": "objectId",
+              "type": "objectId",
+              "title": "Datenpunkt"
+            },
+            {
+              "attr": "role",
+              "type": "text",
+              "title": "Rolle"
+            },
+            {
+              "attr": "unit",
+              "type": "text",
+              "title": "Einheit"
+            }
+          ]
+        },
+        "history.mysql.enabled": {
+          "type": "checkbox",
+          "label": "MySQL aktiv"
+        },
+        "history.mysql.instance": {
+          "type": "text",
+          "label": "MySQL Instanz"
+        },
+        "history.mysql.periodDays": {
+          "type": "number",
+          "label": "Zeitraum (Tage)",
+          "min": 1
+        },
+        "history.mysql.resolutionMin": {
+          "type": "number",
+          "label": "Auflösung (Minuten)",
+          "min": 1
+        },
+        "history.mysql.datapoints": {
+          "type": "table",
+          "label": "MySQL Datenpunkte",
+          "items": [
+            {
+              "attr": "objectId",
+              "type": "objectId",
+              "title": "Datenpunkt"
+            },
+            {
+              "attr": "role",
+              "type": "text",
+              "title": "Rolle"
+            },
+            {
+              "attr": "unit",
+              "type": "text",
+              "title": "Einheit"
+            }
+          ]
         }
       }
     },
