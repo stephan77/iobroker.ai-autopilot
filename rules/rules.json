@@ -1,1 +1,24 @@
-
+{
+  "controlRun": {
+    "type": "impulse",
+    "mustResetImmediately": true,
+    "ignoreAck": true,
+    "lockRequired": true,
+    "neverPoll": true
+  },
+  "admin": {
+    "schemaIsContract": true,
+    "removalForbidden": true,
+    "additiveOnly": true
+  },
+  "gpt": {
+    "contextRequired": true,
+    "liveDataRequired": true,
+    "historyOptional": true,
+    "semanticsRequired": true
+  },
+  "debug": {
+    "mustBeConfigurable": true,
+    "noSpam": true
+  }
+}
