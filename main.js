@@ -21,6 +21,8 @@ class AiAutopilot extends utils.Adapter {
     this.intervalTimer = null;
     this.pendingActions = null;
     this.openaiClient = null;
+    this.feedbackHistory = [];
+    this.lastContextSummary = null;
   }
 
   async onReady() {
@@ -39,6 +41,7 @@ class AiAutopilot extends utils.Adapter {
       this.subscribeStates('control.run');
       this.subscribeStates('memory.feedback');
 
+      await this.loadFeedbackHistory();
       this.startScheduler();
 
       this.log.info('AI Autopilot v0.5.8 ready');
@@ -220,18 +223,36 @@ class AiAutopilot extends utils.Adapter {
     const normalized = feedback.toUpperCase();
     if (normalized === 'JA') {
       this.updateActionStatuses(this.pendingActions, 'approved');
-      await this.setStateAsync('report.actions', JSON.stringify(this.pendingActions, null, 2), true);
-      await this.executeActions(this.pendingActions);
+      if (this.config.dryRun) {
+        this.log.info('Dry-Run aktiv: Aktionen werden nicht ausgeführt.');
+        for (const action of this.pendingActions) {
+          action.executionResult = { status: 'skipped', reason: 'dryRun' };
+        }
+        await this.setStateAsync('report.actions', JSON.stringify(this.pendingActions, null, 2), true);
+        await this.storeFeedbackEntries(
+          this.pendingActions.map((action) =>
+            this.buildFeedbackEntry(action, 'approved', action.executionResult)
+          )
+        );
+      } else {
+        await this.executeActions(this.pendingActions);
+      }
       this.pendingActions = null;
-      await this.setStateAsync('memory.feedback', '', true);
     } else if (normalized === 'NEIN') {
       this.updateActionStatuses(this.pendingActions, 'rejected');
+      for (const action of this.pendingActions) {
+        action.executionResult = { status: 'skipped', reason: 'rejected' };
+      }
       await this.setStateAsync('report.actions', JSON.stringify(this.pendingActions, null, 2), true);
+      await this.storeFeedbackEntries(
+        this.pendingActions.map((action) =>
+          this.buildFeedbackEntry(action, 'rejected', action.executionResult)
+        )
+      );
       this.log.info('Aktionen wurden abgelehnt.');
       this.pendingActions = null;
-      await this.setStateAsync('memory.feedback', '', true);
     } else if (normalized.startsWith('ÄNDERN')) {
-      await this.setStateAsync('memory.feedback', feedback, true);
+      await this.setStateAsync('memory.feedback', JSON.stringify(this.feedbackHistory, null, 2), true);
       this.log.info(`Änderungswunsch: ${feedback}`);
     }
   }
@@ -272,6 +293,7 @@ class AiAutopilot extends utils.Adapter {
         liveData.pvDailySources
       );
       context.summary = energySummary;
+      this.lastContextSummary = this.buildFeedbackContext(context, energySummary);
       const recommendations = this.generateRecommendations(liveData, aggregates, energySummary);
       if (this.config.debug) {
         this.log.info(`[DEBUG] Context built: ${JSON.stringify(this.redactContext(context))}`);
@@ -721,7 +743,8 @@ class AiAutopilot extends utils.Adapter {
     const payload = {
       ...context,
       live: livePayload,
-      policy: await this.getStateAsync('memory.policy')
+      policy: await this.getStateAsync('memory.policy'),
+      feedback: this.feedbackHistory
     };
 
     const prompt = `Du bist ein Haus-Autopilot. Analysiere die Daten und gib Empfehlungen mit Begründung. Nenne fehlende Daten explizit.\n\n${JSON.stringify(payload, null, 2)}`;
@@ -830,7 +853,33 @@ class AiAutopilot extends utils.Adapter {
   }
 
   async executeActions(actions) {
-    this.log.info(`Aktionen freigegeben: ${actions.length}`);
+    const approvedActions = actions.filter((action) => action.status === 'approved');
+    this.log.info(`Aktionen freigegeben: ${approvedActions.length}`);
+    const handlers = this.getActionHandlers();
+
+    for (const action of approvedActions) {
+      const handler = handlers[action.category];
+      try {
+        if (!handler) {
+          action.executionResult = { status: 'skipped', reason: 'noHandler' };
+        } else {
+          const result = await handler(action);
+          action.executionResult = result || { status: 'success' };
+        }
+      } catch (error) {
+        action.executionResult = { status: 'error', message: error.message };
+        this.handleError(`Aktion fehlgeschlagen: ${action.description}`, error, true);
+      } finally {
+        action.status = 'executed';
+      }
+    }
+
+    await this.setStateAsync('report.actions', JSON.stringify(actions, null, 2), true);
+    await this.storeFeedbackEntries(
+      approvedActions.map((action) =>
+        this.buildFeedbackEntry(action, 'approved', action.executionResult)
+      )
+    );
   }
 
   buildApprovalMessage(actions, reportText) {
@@ -847,6 +896,29 @@ class AiAutopilot extends utils.Adapter {
     for (const action of actions) {
       action.status = status;
     }
+  }
+
+  getActionHandlers() {
+    return {
+      energy: async (action) => this.handleEnergyAction(action),
+      heating: async (action) => this.handleHeatingAction(action),
+      water: async (action) => this.handleWaterAction(action)
+    };
+  }
+
+  async handleEnergyAction(action) {
+    this.log.info(`Energie-Aktion: ${action.description}`);
+    return { status: 'success', message: 'Energie-Aktion protokolliert' };
+  }
+
+  async handleHeatingAction(action) {
+    this.log.info(`Heizungs-Aktion: ${action.description}`);
+    return { status: 'success', message: 'Heizungs-Aktion protokolliert' };
+  }
+
+  async handleWaterAction(action) {
+    this.log.info(`Wasser-Aktion: ${action.description}`);
+    return { status: 'success', message: 'Wasser-Aktion protokolliert' };
   }
 
   async sendTelegramMessage(subject, reportText) {
@@ -1018,6 +1090,65 @@ class AiAutopilot extends utils.Adapter {
       return '';
     }
     return text.length > GPT_LOG_TRIM ? `${text.slice(0, GPT_LOG_TRIM)}...` : text;
+  }
+
+  async loadFeedbackHistory() {
+    try {
+      const existing = await this.getStateAsync('memory.feedback');
+      if (!existing || !existing.val) {
+        this.feedbackHistory = [];
+        return;
+      }
+      const parsed = JSON.parse(String(existing.val));
+      if (Array.isArray(parsed)) {
+        this.feedbackHistory = parsed;
+      } else if (parsed && typeof parsed === 'object') {
+        this.feedbackHistory = [parsed];
+      } else {
+        this.feedbackHistory = [];
+      }
+    } catch (error) {
+      this.feedbackHistory = [];
+      this.handleError('Feedback Historie konnte nicht geladen werden', error, true);
+    }
+  }
+
+  buildFeedbackContext(context, energySummary) {
+    return {
+      timestamp: context.timestamp,
+      mode: context.mode,
+      dryRun: context.dryRun,
+      summary: {
+        pvTotal: energySummary.pvTotal,
+        pvDaily: energySummary.pvDaily,
+        houseConsumption: energySummary.houseConsumption,
+        batterySoc: energySummary.batterySoc,
+        gridPower: energySummary.gridPower
+      }
+    };
+  }
+
+  buildFeedbackEntry(action, approvalResult, executionResult) {
+    return {
+      actionId: action.id,
+      approval: approvalResult,
+      executionResult,
+      context: this.lastContextSummary,
+      action: {
+        category: action.category,
+        priority: action.priority,
+        description: action.description
+      },
+      timestamp: new Date().toISOString()
+    };
+  }
+
+  async storeFeedbackEntries(entries) {
+    if (!Array.isArray(entries) || entries.length === 0) {
+      return;
+    }
+    this.feedbackHistory = [...this.feedbackHistory, ...entries];
+    await this.setStateAsync('memory.feedback', JSON.stringify(this.feedbackHistory, null, 2), true);
   }
 
   handleError(prefix, error, soft = false) {
