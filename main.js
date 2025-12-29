@@ -261,7 +261,12 @@ class AiAutopilot extends utils.Adapter {
         await this.setStateAsync('info.lastError', '', true);
         return;
       }
-      const energySummary = this.buildEnergySummary(context.live.energy);
+      const energySummary = this.buildEnergySummary(
+        context.live.energy,
+        liveData.pvSources,
+        liveData.pvDailySources
+      );
+      context.summary = energySummary;
       const recommendations = this.generateRecommendations(liveData, aggregates, energySummary);
       if (this.config.debug) {
         this.log.info(`[DEBUG] Context built: ${JSON.stringify(this.redactContext(context))}`);
@@ -634,7 +639,7 @@ class AiAutopilot extends utils.Adapter {
   generateRecommendations(liveData, aggregates, energySummary) {
     const recommendations = [];
 
-    const pvTotal = this.sumTableValues(liveData.pvSources);
+    const pvTotal = energySummary.pvTotal || 0;
     const gridPower = energySummary.gridPower || 0;
     const houseConsumption = energySummary.houseConsumption || 0;
     const batterySoc = energySummary.batterySoc;
@@ -710,8 +715,11 @@ class AiAutopilot extends utils.Adapter {
   }
 
   async callOpenAI(context) {
+    const livePayload = { ...context.live };
+    delete livePayload.energy;
     const payload = {
       ...context,
+      live: livePayload,
       policy: await this.getStateAsync('memory.policy')
     };
 
@@ -768,8 +776,8 @@ class AiAutopilot extends utils.Adapter {
     lines.push(`Trigger: ${new Date().toISOString()}`);
     lines.push(`Modus: ${this.config.mode}`);
     lines.push(`Dry-Run: ${this.config.dryRun}`);
-    lines.push(`PV gesamt: ${this.sumTableValues(liveData.pvSources)}`);
-    lines.push(`PV Tagesenergie: ${this.sumTableValues(liveData.pvDailySources)}`);
+    lines.push(`PV gesamt: ${energySummary.pvTotal}`);
+    lines.push(`PV Tagesenergie: ${energySummary.pvDaily}`);
     lines.push(`Hausverbrauch: ${energySummary.houseConsumption}`);
     lines.push(`Batterie SOC: ${energySummary.batterySoc ?? 'n/a'}`);
     if (liveData.water.hotWater !== null || liveData.water.coldWater !== null) {
@@ -960,7 +968,7 @@ class AiAutopilot extends utils.Adapter {
     return table.reduce((sum, entry) => sum + (Number(entry.value) || 0), 0);
   }
 
-  buildEnergySummary(energyEntries) {
+  buildEnergySummary(energyEntries, pvSources, pvDailySources) {
     const sumRole = (role) => {
       const values = (energyEntries || [])
         .filter((entry) => entry && entry.role === role)
@@ -974,6 +982,8 @@ class AiAutopilot extends utils.Adapter {
 
     return {
       houseConsumption: sumRole('houseConsumption'),
+      pvTotal: this.sumTableValues(pvSources),
+      pvDaily: this.sumTableValues(pvDailySources),
       gridPower: sumRole('gridPower'),
       gridImport: sumRole('gridImport'),
       gridExport: sumRole('gridExport'),
