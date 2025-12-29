@@ -17,7 +17,7 @@ class AiAutopilot extends utils.Adapter {
     this.on('stateChange', (id, state) => this.onStateChange(id, state));
     this.on('unload', (callback) => this.onUnload(callback));
 
-    this.runLock = false;
+    this.running = false;
     this.intervalTimer = null;
     this.pendingActions = null;
     this.openaiClient = null;
@@ -158,25 +158,42 @@ class AiAutopilot extends utils.Adapter {
     const intervalMs = intervalMin * MINUTE_MS;
 
     this.intervalTimer = setInterval(() => {
-      this.runAnalysis('interval').catch((error) => {
+      this.runAnalysisWithLock('interval').catch((error) => {
         this.handleError('Interval analysis failed', error);
       });
     }, intervalMs);
 
-    this.runAnalysis('startup').catch((error) => {
+    this.runAnalysisWithLock('startup').catch((error) => {
       this.handleError('Startup analysis failed', error);
     });
   }
 
   async onStateChange(id, state) {
-    if (!state || state.ack) {
-      return;
-    }
+    if (!state) return;
 
-    if (id === `${this.namespace}.control.run` && state.val === true) {
+    // IGNORIERE ACK EVENTS
+    if (state.ack) return;
+
+    if (id === this.namespace + '.control.run' && state.val === true) {
+
+      // SOFORT zurücksetzen (Impuls!)
       await this.setStateAsync('control.run', false, true);
-      await this.runAnalysis('manual');
-      return;
+
+      // Mehrfachlauf verhindern
+      if (this.running) {
+        this.log.warn('Analysis already running, trigger ignored');
+        return;
+      }
+
+      this.running = true;
+
+      try {
+        await this.runAnalysis();   // <-- HIER MUSS GPT AUFGERUFEN WERDEN
+      } catch (e) {
+        this.log.error('Analysis failed: ' + e.message);
+      } finally {
+        this.running = false;
+      }
     }
 
     if (id === `${this.namespace}.memory.feedback`) {
@@ -203,13 +220,21 @@ class AiAutopilot extends utils.Adapter {
     }
   }
 
-  async runAnalysis(trigger) {
-    if (this.runLock) {
-      this.log.info('Analyse läuft bereits, neuer Trigger wird übersprungen.');
+  async runAnalysisWithLock(trigger) {
+    if (this.running) {
+      this.log.warn('Analysis already running, trigger ignored');
       return;
     }
 
-    this.runLock = true;
+    this.running = true;
+    try {
+      await this.runAnalysis(trigger);
+    } finally {
+      this.running = false;
+    }
+  }
+
+  async runAnalysis(trigger) {
     await this.setStateAsync('info.connection', true, true);
 
     try {
@@ -236,7 +261,6 @@ class AiAutopilot extends utils.Adapter {
     } catch (error) {
       this.handleError('Analyse fehlgeschlagen', error);
     } finally {
-      this.runLock = false;
       await this.setStateAsync('info.connection', false, true);
     }
   }
@@ -460,7 +484,7 @@ class AiAutopilot extends utils.Adapter {
 
   async callOpenAI(liveData, aggregates, recommendations) {
     if (!this.openaiClient) {
-      return null;
+      throw new Error('OpenAI not configured');
     }
 
     const payload = {
