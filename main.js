@@ -254,8 +254,8 @@ class AiAutopilot extends utils.Adapter {
       const historyData = await this.collectHistoryData();
       const aggregates = this.aggregateData(historyData);
       const context = await this.buildContext(liveData, aggregates);
-      const houseConsumption = this.sumHouseConsumption(context.live.energy);
-      const recommendations = this.generateRecommendations(liveData, aggregates, houseConsumption);
+      const energySummary = this.buildEnergySummary(context.live.energy);
+      const recommendations = this.generateRecommendations(liveData, aggregates, energySummary);
       if (this.config.debug) {
         this.log.info(`[DEBUG] Context built: ${JSON.stringify(this.redactContext(context))}`);
       }
@@ -274,7 +274,7 @@ class AiAutopilot extends utils.Adapter {
       } else {
         gptInsights = 'OpenAI not configured - GPT analysis skipped.';
       }
-      const reportText = this.buildReportText(liveData, aggregates, recommendations, gptInsights, houseConsumption);
+      const reportText = this.buildReportText(liveData, aggregates, recommendations, gptInsights, energySummary);
       const actions = this.buildActions(recommendations, gptInsights);
 
       await this.setStateAsync('report.last', reportText, true);
@@ -296,13 +296,6 @@ class AiAutopilot extends utils.Adapter {
 
   async collectLiveData() {
     const data = {
-      energy: {
-        gridPower: await this.readNumber(this.config.energy.gridPower),
-        batterySoc: await this.readNumber(this.config.energy.batterySoc),
-        batteryPower: await this.readNumber(this.config.energy.batteryPower),
-        wallbox: await this.readNumber(this.config.energy.wallbox),
-        additionalSources: await this.readTableNumbers(this.config.energy.additionalSources)
-      },
       pvSources: await this.readTableNumbers(this.config.pvSources),
       pvDailySources: await this.readTableNumbers(this.config.pvDailySources),
       consumers: await this.readConsumerTable(),
@@ -639,11 +632,13 @@ class AiAutopilot extends utils.Adapter {
     return aggregated;
   }
 
-  generateRecommendations(liveData, aggregates, houseConsumption) {
+  generateRecommendations(liveData, aggregates, energySummary) {
     const recommendations = [];
 
     const pvTotal = this.sumTableValues(liveData.pvSources);
-    const gridPower = liveData.energy.gridPower || 0;
+    const gridPower = energySummary.gridPower || 0;
+    const houseConsumption = energySummary.houseConsumption || 0;
+    const batterySoc = energySummary.batterySoc;
 
     if (pvTotal > houseConsumption && gridPower < 0) {
       recommendations.push({
@@ -653,7 +648,7 @@ class AiAutopilot extends utils.Adapter {
       });
     }
 
-    if (liveData.energy.batterySoc !== null && liveData.energy.batterySoc < 20) {
+    if (batterySoc !== null && batterySoc < 20) {
       recommendations.push({
         category: 'energy',
         description: 'Batterie SOC niedrig. Tiefentladung vermeiden.',
@@ -769,15 +764,15 @@ class AiAutopilot extends utils.Adapter {
     return texts.join('\n');
   }
 
-  buildReportText(liveData, aggregates, recommendations, gptInsights, houseConsumption) {
+  buildReportText(liveData, aggregates, recommendations, gptInsights, energySummary) {
     const lines = [];
     lines.push(`Trigger: ${new Date().toISOString()}`);
     lines.push(`Modus: ${this.config.mode}`);
     lines.push(`Dry-Run: ${this.config.dryRun}`);
     lines.push(`PV gesamt: ${this.sumTableValues(liveData.pvSources)}`);
     lines.push(`PV Tagesenergie: ${this.sumTableValues(liveData.pvDailySources)}`);
-    lines.push(`Hausverbrauch: ${houseConsumption}`);
-    lines.push(`Batterie SOC: ${liveData.energy.batterySoc ?? 'n/a'}`);
+    lines.push(`Hausverbrauch: ${energySummary.houseConsumption}`);
+    lines.push(`Batterie SOC: ${energySummary.batterySoc ?? 'n/a'}`);
     if (liveData.water.hotWater !== null || liveData.water.coldWater !== null) {
       lines.push(`Warmwasser Verbrauch: ${liveData.water.hotWater ?? 'n/a'}`);
       lines.push(`Kaltwasser Verbrauch: ${liveData.water.coldWater ?? 'n/a'}`);
@@ -966,16 +961,27 @@ class AiAutopilot extends utils.Adapter {
     return table.reduce((sum, entry) => sum + (Number(entry.value) || 0), 0);
   }
 
-  sumHouseConsumption(energyEntries) {
-    if (!Array.isArray(energyEntries)) {
-      return 0;
-    }
-    return energyEntries.reduce((sum, entry) => {
-      if (entry && entry.role === 'houseConsumption') {
-        return sum + (Number(entry.value) || 0);
+  buildEnergySummary(energyEntries) {
+    const sumRole = (role) => {
+      const values = (energyEntries || [])
+        .filter((entry) => entry && entry.role === role)
+        .map((entry) => Number(entry.value))
+        .filter((value) => Number.isFinite(value));
+      if (values.length === 0) {
+        return null;
       }
-      return sum;
-    }, 0);
+      return values.reduce((sum, value) => sum + value, 0);
+    };
+
+    return {
+      houseConsumption: sumRole('houseConsumption'),
+      gridPower: sumRole('gridPower'),
+      gridImport: sumRole('gridImport'),
+      gridExport: sumRole('gridExport'),
+      batterySoc: sumRole('batterySoc'),
+      batteryPower: sumRole('batteryPower'),
+      wallbox: sumRole('wallbox')
+    };
   }
 
   logDebug(message, payload) {
