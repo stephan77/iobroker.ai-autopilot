@@ -1,1 +1,14 @@
-
+{
+  "tabs": {
+    "base": ["openaiApiKey", "model", "mode", "interval", "dryRun", "debug"],
+    "telegram": ["enabled", "instance", "chatId"],
+    "energy": ["energySources", "pvSources", "battery"],
+    "temperature": ["rooms", "heaters", "outside"],
+    "water": ["waterSources"],
+    "history": ["influx", "mysql"]
+  },
+  "rules": {
+    "tabsMustExist": true,
+    "fieldsAdditiveOnly": true
+  }
+}
