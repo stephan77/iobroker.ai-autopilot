@@ -175,9 +175,15 @@ class AiAutopilot extends utils.Adapter {
     if (state.ack) return;
 
     if (id === this.namespace + '.control.run' && state.val === true) {
+      if (this.config.debug) {
+        this.log.info('[DEBUG] Trigger received: control.run');
+      }
 
       // SOFORT zurücksetzen (Impuls!)
       await this.setStateAsync('control.run', false, true);
+      if (this.config.debug) {
+        this.log.info('[DEBUG] control.run reset');
+      }
 
       // Mehrfachlauf verhindern
       if (this.running) {
@@ -242,7 +248,15 @@ class AiAutopilot extends utils.Adapter {
       const historyData = await this.collectHistoryData();
       const aggregates = this.aggregateData(historyData);
       const recommendations = this.generateRecommendations(liveData, aggregates);
-      const gptInsights = await this.callOpenAI(liveData, aggregates, recommendations);
+      if (this.config.debug) {
+        this.log.info('[DEBUG] Context built');
+      }
+      let gptInsights = null;
+      if (this.openaiClient) {
+        gptInsights = await this.callOpenAI(liveData, aggregates, recommendations);
+      } else {
+        gptInsights = 'OpenAI not configured - GPT analysis skipped.';
+      }
       const reportText = this.buildReportText(liveData, aggregates, recommendations, gptInsights);
       const actions = this.buildActions(recommendations, gptInsights);
 
@@ -483,10 +497,6 @@ class AiAutopilot extends utils.Adapter {
   }
 
   async callOpenAI(liveData, aggregates, recommendations) {
-    if (!this.openaiClient) {
-      throw new Error('OpenAI not configured');
-    }
-
     const payload = {
       liveData,
       aggregates,
@@ -497,6 +507,9 @@ class AiAutopilot extends utils.Adapter {
     const prompt = `Du bist ein Haus-Autopilot. Analysiere die Daten und gib Empfehlungen mit Begründung. Nenne fehlende Daten explizit.\n\n${JSON.stringify(payload, null, 2)}`;
 
     try {
+      if (this.config.debug) {
+        this.log.info('[DEBUG] GPT request sent');
+      }
       const response = await this.openaiClient.responses.create({
         model: this.config.model || 'gpt-4o',
         input: [
@@ -515,7 +528,7 @@ class AiAutopilot extends utils.Adapter {
       const outputText = response.output_text || this.extractOutputText(response);
       if (this.config.debug) {
         this.log.info(`[DEBUG] GPT request: ${this.trimLog(prompt)}`);
-        this.log.info(`[DEBUG] GPT response: ${this.trimLog(outputText || '')}`);
+        this.log.info(`[DEBUG] GPT response received: ${this.trimLog(outputText || '')}`);
       }
       return outputText || null;
     } catch (error) {
