@@ -634,6 +634,9 @@ class AiAutopilot extends utils.Adapter {
   }
 
   async runAnalysis(trigger) {
+    let reportText = '';
+    let finalActions = [];
+    let lastErrorMessage = '';
     try {
       if (this.config.debug) {
         this.log.info(`[DEBUG] Config summary: ${JSON.stringify(this.buildConfigSummary())}`);
@@ -656,52 +659,58 @@ class AiAutopilot extends utils.Adapter {
           `[DEBUG] History deviations: ${JSON.stringify(context.history.deviations, null, 2)}`
         );
       }
+      let skipAnalysis = false;
       if (context.live.energy.length === 0) {
-        const message = 'No energy sources configured – analysis skipped.';
-        await this.setStateAsync('report.last', message, true);
-        await this.setStateAsync('report.actions', JSON.stringify([], null, 2), true);
-        await this.setStateAsync('info.lastError', '', true);
-        return;
+        reportText = 'No energy sources configured – analysis skipped.';
+        skipAnalysis = true;
       }
-      const energySummary = this.buildEnergySummary(context.live.energy);
-      if (this.config.debug) {
-        this.log.info(`[DEBUG] Energy summary: ${JSON.stringify(energySummary, null, 2)}`);
-      }
-      const missingEnergyValues = this.getMissingEnergyValues(context.live.energy, energySummary);
-      if (missingEnergyValues.length > 0) {
-        const message = `Energy summary missing values for roles: ${missingEnergyValues.join(', ')}`;
-        await this.setStateAsync('report.last', message, true);
-        await this.setStateAsync('report.actions', JSON.stringify([], null, 2), true);
-        await this.setStateAsync('info.lastError', '', true);
-        return;
-      }
-      context.summary = energySummary;
-      this.lastContextSummary = this.buildFeedbackContext(context, energySummary);
-      const recommendations = this.generateRecommendations(liveData, aggregates, energySummary);
-      if (this.config.debug) {
-        this.log.info(`[DEBUG] Context built: ${JSON.stringify(this.redactContext(context))}`);
+      let energySummary = this.buildEmptySummary();
+      if (!skipAnalysis) {
+        energySummary = this.buildEnergySummary(context.live.energy);
+        if (this.config.debug) {
+          this.log.info(`[DEBUG] Energy summary: ${JSON.stringify(energySummary, null, 2)}`);
+        }
+        const missingEnergyValues = this.getMissingEnergyValues(context.live.energy, energySummary);
+        if (missingEnergyValues.length > 0) {
+          reportText = `Energy summary missing values for roles: ${missingEnergyValues.join(', ')}`;
+          skipAnalysis = true;
+        }
       }
 
-      let gptInsights = 'OpenAI not configured - GPT analysis skipped.';
-      if (this.openaiClient) {
-        gptInsights = await this.generateGptInsights(context, energySummary, recommendations);
-      }
-      const reportText = this.buildReportText(liveData, aggregates, recommendations, gptInsights, energySummary);
-      const actions = this.buildDeviationActions(context);
-      const refinedActions = await this.refineActionsWithGpt(context.history.deviations, actions);
-      const finalActions = this.dedupeActions(refinedActions);
+      if (!skipAnalysis) {
+        context.summary = energySummary;
+        this.lastContextSummary = this.buildFeedbackContext(context, energySummary);
+        const recommendations = this.generateRecommendations(liveData, aggregates, energySummary);
+        if (this.config.debug) {
+          this.log.info(`[DEBUG] Context built: ${JSON.stringify(this.redactContext(context))}`);
+        }
 
+        let gptInsights = 'OpenAI not configured - GPT analysis skipped.';
+        if (this.openaiClient) {
+          gptInsights = await this.generateGptInsights(context, energySummary, recommendations);
+        }
+        reportText = this.buildReportText(liveData, aggregates, recommendations, gptInsights, energySummary);
+        const actions = this.buildDeviationActions(context);
+        const refinedActions = await this.refineActionsWithGpt(context.history.deviations, actions);
+        finalActions = this.dedupeActions(refinedActions);
+      }
+
+      lastErrorMessage = '';
+    } catch (error) {
+      this.handleError('Analyse fehlgeschlagen', error);
+      if (!reportText) {
+        reportText = `Analyse fehlgeschlagen: ${error.message}`;
+      }
+      lastErrorMessage = `Analyse fehlgeschlagen: ${error.message}`;
+    } finally {
       await this.setStateAsync('report.last', reportText, true);
       await this.setStateAsync('report.actions', JSON.stringify(finalActions, null, 2), true);
 
-      if (finalActions.length > 0 && !this.config.dryRun && this.config.telegram.enabled) {
+      if (!this.config.dryRun && this.config.telegram.enabled) {
         await this.requestApproval(finalActions, reportText);
       }
 
-      await this.setStateAsync('info.lastError', '', true);
-    } catch (error) {
-      this.handleError('Analyse fehlgeschlagen', error);
-    } finally {
+      await this.setStateAsync('info.lastError', lastErrorMessage, true);
       if (this.config.debug) {
         this.log.info('[DEBUG] Analysis finished');
       }
