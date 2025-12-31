@@ -67,6 +67,7 @@ class AiAutopilot extends utils.Adapter {
   async onReady() {
     try {
       await this.ensureStates();
+      await this.syncConfigToStates();
       await this.setStateAsync('info.lastError', '', true);
 
       if (this.config.debug) {
