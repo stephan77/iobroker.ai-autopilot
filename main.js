@@ -20,6 +20,7 @@ class AiAutopilot extends utils.Adapter {
 
     this.running = false;
     this.intervalTimer = null;
+    this.dailyReportTimer = null;
     this.pendingActions = null;
     this.openaiClient = null;
     this.feedbackHistory = [];
@@ -59,6 +60,10 @@ class AiAutopilot extends utils.Adapter {
       if (this.intervalTimer) {
         clearInterval(this.intervalTimer);
         this.intervalTimer = null;
+      }
+      if (this.dailyReportTimer) {
+        clearInterval(this.dailyReportTimer);
+        this.dailyReportTimer = null;
       }
       callback();
     } catch (error) {
@@ -128,6 +133,18 @@ class AiAutopilot extends utils.Adapter {
       native: {}
     });
 
+    await this.setObjectNotExistsAsync('report.dailyLastSent', {
+      type: 'state',
+      common: {
+        type: 'string',
+        role: 'text',
+        read: true,
+        write: false,
+        def: ''
+      },
+      native: {}
+    });
+
     await this.setObjectNotExistsAsync('memory.feedback', {
       type: 'state',
       common: {
@@ -159,6 +176,8 @@ class AiAutopilot extends utils.Adapter {
       this.intervalTimer = null;
     }
 
+    this.startDailyReportScheduler();
+
     if (this.config.mode === 'manual') {
       this.log.info('Manual mode active. Waiting for control.run.');
       return;
@@ -176,6 +195,350 @@ class AiAutopilot extends utils.Adapter {
     this.runAnalysisWithLock('startup').catch((error) => {
       this.handleError('Startup analysis failed', error);
     });
+  }
+
+  startDailyReportScheduler() {
+    if (this.dailyReportTimer) {
+      clearInterval(this.dailyReportTimer);
+      this.dailyReportTimer = null;
+    }
+
+    this.dailyReportTimer = setInterval(() => {
+      this.runDailyReportIfDue().catch((error) => {
+        this.handleError('Daily report failed', error, true);
+      });
+    }, MINUTE_MS);
+
+    this.runDailyReportIfDue().catch((error) => {
+      this.handleError('Daily report failed', error, true);
+    });
+  }
+
+  async runDailyReportIfDue() {
+    if (!this.config.telegram?.enabled) {
+      return;
+    }
+
+    const now = new Date();
+    const schedule = this.getDailyReportSchedule();
+    if (now.getHours() < schedule.hour || (now.getHours() === schedule.hour && now.getMinutes() < schedule.minute)) {
+      return;
+    }
+
+    const todayStamp = this.formatLocalDateStamp(now);
+    const lastSent = await this.readState('report.dailyLastSent');
+    if (lastSent === todayStamp) {
+      return;
+    }
+
+    const report = await this.buildDailyReport();
+    if (!report) {
+      return;
+    }
+
+    if (this.config.debug) {
+      this.log.info(`[DEBUG] Sending daily Telegram report for ${todayStamp}`);
+    }
+
+    try {
+      await this.sendTelegramMessage(report, { parseMode: 'Markdown' });
+      await this.setStateAsync('report.dailyLastSent', todayStamp, true);
+    } catch (error) {
+      this.handleError('Daily report send failed', error, true);
+    }
+  }
+
+  getDailyReportSchedule() {
+    return { hour: 7, minute: 0 };
+  }
+
+  formatLocalDateStamp(date) {
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+  }
+
+  async buildDailyReport() {
+    const liveData = await this.collectLiveData();
+    const historyData = await this.collectHistoryData();
+    const houseSeries = this.findHistorySeries(historyData, this.config.energy?.houseConsumption, ['consumption']);
+    const gridSeries = this.findHistorySeries(historyData, this.config.energy?.gridPower, ['grid']);
+    const batterySeries = this.findHistorySeries(historyData, this.config.energy?.batterySoc, ['battery', 'soc']);
+    const waterSeries = this.findHistorySeries(historyData, this.getWaterBaselineId(), ['water']);
+    const outsideSeries = this.findHistorySeries(historyData, this.config.temperature?.outside, ['outside', 'temp']);
+
+    const houseStats = this.computeSeriesStats(houseSeries?.values);
+    const batteryStats = this.computeSeriesStats(batterySeries?.values);
+    const waterStats = this.computeSeriesStats(waterSeries?.values);
+    const outsideStats = this.computeSeriesStats(outsideSeries?.values);
+    const insideAvgTemp = this.averageNumbers(
+      (liveData.rooms || [])
+        .map((room) => room.temperature)
+        .filter((temp) => Number.isFinite(temp))
+    );
+
+    const pvEnergyTotal = await this.sumDailyPvEnergy(liveData);
+    const gridImportKwh = this.calculateGridImportKwh(gridSeries?.values);
+    const waterTotal = this.resolveWaterTotal(liveData, waterStats);
+    const waterBreakdown = this.resolveWaterBreakdown(liveData);
+    const nightWaterWarning = this.isNightWaterUsageWarning(waterSeries?.values);
+    const frostDetected = this.isFrostDetected(outsideSeries?.values, liveData.temperature?.frostRisk);
+    const actionSummary = await this.loadActionSummary();
+
+    return this.buildDailyReportText({
+      date: new Date(),
+      energy: {
+        avgConsumption: houseStats.avg,
+        peakConsumption: houseStats.max,
+        pvEnergyTotal: pvEnergyTotal,
+        gridImportKwh: gridImportKwh,
+        batteryMin: batteryStats.min,
+        batteryMax: batteryStats.max
+      },
+      water: {
+        total: waterTotal,
+        hot: waterBreakdown.hot,
+        cold: waterBreakdown.cold,
+        nightWarning: nightWaterWarning
+      },
+      climate: {
+        insideAvg: insideAvgTemp,
+        outsideAvg: outsideStats.avg,
+        frostDetected: frostDetected
+      },
+      actions: actionSummary
+    });
+  }
+
+  findHistorySeries(historyData, id, roleHints = []) {
+    const series = [...(historyData.influx?.series || []), ...(historyData.mysql?.series || [])];
+    if (id) {
+      const exact = series.find((entry) => entry && entry.id === id);
+      if (exact) {
+        return exact;
+      }
+    }
+
+    const normalizedHints = roleHints.map((hint) => String(hint).toLowerCase());
+    if (normalizedHints.length > 0) {
+      const byRole = series.find((entry) => {
+        const role = String(entry?.role || '').toLowerCase();
+        return normalizedHints.every((hint) => role.includes(hint));
+      });
+      if (byRole) {
+        return byRole;
+      }
+    }
+
+    return null;
+  }
+
+  computeSeriesStats(values) {
+    if (!Array.isArray(values) || values.length === 0) {
+      return { avg: null, min: null, max: null };
+    }
+    const numbers = values.map((entry) => Number(entry.value)).filter((value) => Number.isFinite(value));
+    if (numbers.length === 0) {
+      return { avg: null, min: null, max: null };
+    }
+    const sum = numbers.reduce((total, value) => total + value, 0);
+    return {
+      avg: sum / numbers.length,
+      min: Math.min(...numbers),
+      max: Math.max(...numbers)
+    };
+  }
+
+  async sumDailyPvEnergy(liveData) {
+    let total = 0;
+    if (Array.isArray(liveData.pvDailySources)) {
+      total += liveData.pvDailySources.reduce((sum, entry) => sum + (Number(entry.value) || 0), 0);
+    }
+    for (const src of this.config.pvSources || []) {
+      if (!src || !src.dailyObjectId) {
+        continue;
+      }
+      const value = await this.readNumber(src.dailyObjectId);
+      if (Number.isFinite(value)) {
+        total += value;
+      }
+    }
+    return total > 0 ? total : null;
+  }
+
+  calculateGridImportKwh(values) {
+    if (!Array.isArray(values) || values.length < 2) {
+      return null;
+    }
+    const sorted = [...values].sort((a, b) => a.ts - b.ts);
+    let wattHours = 0;
+    for (let i = 0; i < sorted.length - 1; i += 1) {
+      const current = sorted[i];
+      const next = sorted[i + 1];
+      const value = Number(current.value);
+      const deltaHours = (next.ts - current.ts) / HOUR_MS;
+      if (!Number.isFinite(value) || !Number.isFinite(deltaHours) || deltaHours <= 0) {
+        continue;
+      }
+      if (value > 0) {
+        wattHours += value * deltaHours;
+      }
+    }
+    if (!Number.isFinite(wattHours) || wattHours <= 0) {
+      return null;
+    }
+    return wattHours / 1000;
+  }
+
+  getWaterBaselineId() {
+    return this.config.water?.daily || this.config.water?.total || this.config.water?.flow || null;
+  }
+
+  resolveWaterTotal(liveData, waterStats) {
+    if (Number.isFinite(liveData.water?.daily)) {
+      return liveData.water.daily;
+    }
+    if (Number.isFinite(liveData.water?.total)) {
+      return liveData.water.total;
+    }
+    if (Number.isFinite(waterStats?.avg)) {
+      return waterStats.avg;
+    }
+    const additional = this.sumTableValues(liveData.water?.additionalSources || []);
+    return additional > 0 ? additional : null;
+  }
+
+  resolveWaterBreakdown(liveData) {
+    return {
+      hot: Number.isFinite(liveData.water?.hotWater) ? liveData.water.hotWater : null,
+      cold: Number.isFinite(liveData.water?.coldWater) ? liveData.water.coldWater : null
+    };
+  }
+
+  isNightWaterUsageWarning(values) {
+    if (!Array.isArray(values) || values.length === 0) {
+      return false;
+    }
+    const dayValues = [];
+    const nightValues = [];
+    for (const entry of values) {
+      const timestamp = new Date(entry.ts);
+      const hour = timestamp.getHours();
+      const value = Number(entry.value);
+      if (!Number.isFinite(value)) {
+        continue;
+      }
+      if (hour >= DAY_START_HOUR && hour < NIGHT_START_HOUR) {
+        dayValues.push(value);
+      } else {
+        nightValues.push(value);
+      }
+    }
+    const dayAvg = this.averageNumbers(dayValues);
+    const nightAvg = this.averageNumbers(nightValues);
+    if (!Number.isFinite(nightAvg)) {
+      return false;
+    }
+    if (!Number.isFinite(dayAvg)) {
+      return nightAvg > 0;
+    }
+    return nightAvg > dayAvg * 0.5;
+  }
+
+  isFrostDetected(values, frostRiskState) {
+    if (frostRiskState === true || frostRiskState === 'true' || frostRiskState === 1) {
+      return true;
+    }
+    if (!Array.isArray(values) || values.length === 0) {
+      return false;
+    }
+    const stats = this.computeSeriesStats(values);
+    return Number.isFinite(stats.min) && stats.min <= 0;
+  }
+
+  async loadActionSummary() {
+    const state = await this.getStateAsync('report.actions');
+    if (!state || !state.val) {
+      return { proposed: 0, approved: 0, rejected: 0, executed: 0 };
+    }
+    try {
+      const actions = JSON.parse(state.val);
+      if (!Array.isArray(actions)) {
+        return { proposed: 0, approved: 0, rejected: 0, executed: 0 };
+      }
+      const summary = { proposed: 0, approved: 0, rejected: 0, executed: 0 };
+      for (const action of actions) {
+        const status = String(action?.status || 'proposed').toLowerCase();
+        summary.proposed += 1;
+        if (status === 'approved') {
+          summary.approved += 1;
+        }
+        if (status === 'rejected') {
+          summary.rejected += 1;
+        }
+        if (status === 'executed') {
+          summary.executed += 1;
+        }
+      }
+      return summary;
+    } catch (error) {
+      this.handleError('Daily report actions parsing failed', error, true);
+      return { proposed: 0, approved: 0, rejected: 0, executed: 0 };
+    }
+  }
+
+  buildDailyReportText(data) {
+    if (!data) {
+      return '';
+    }
+    const dateLabel = data.date.toLocaleDateString('de-DE');
+    const lines = [
+      '📊🏠 *Tagesbericht – AI Autopilot*',
+      `🗓️ ${dateLabel}`,
+      '',
+      '⚡ *Energie*',
+      `- Ø Verbrauch: ${this.formatWatts(data.energy.avgConsumption)}`,
+      `- Spitze: ${this.formatWatts(data.energy.peakConsumption)}`,
+      `- PV: ${this.formatKwh(data.energy.pvEnergyTotal)}`,
+      `- Netz: ${this.formatKwh(data.energy.gridImportKwh)}`,
+      `- Batterie: ${this.formatSocRange(data.energy.batteryMin, data.energy.batteryMax)}`,
+      '',
+      '💧 *Wasser*',
+      `- Gesamt: ${this.formatLiters(data.water.total)}`
+    ];
+
+    if (Number.isFinite(data.water.hot)) {
+      lines.push(`- Warmwasser: ${this.formatLiters(data.water.hot)}`);
+    }
+    if (Number.isFinite(data.water.cold)) {
+      lines.push(`- Kaltwasser: ${this.formatLiters(data.water.cold)}`);
+    }
+    if (data.water.nightWarning) {
+      lines.push('- ⚠️ Nachtverbrauch erhöht');
+    }
+
+    lines.push(
+      '',
+      '🌡️ *Klima*',
+      `- Innen: ${this.formatTemperature(data.climate.insideAvg)}`,
+      `- Außen: ${this.formatTemperature(data.climate.outsideAvg)}`
+    );
+
+    if (data.climate.frostDetected) {
+      lines.push('- ❄️ Frost erkannt');
+    }
+
+    lines.push(
+      '',
+      '🤖 *Aktionen*',
+      `- Vorgeschlagen: ${data.actions.proposed}`,
+      `- Freigegeben: ${data.actions.approved}`,
+      `- Abgelehnt: ${data.actions.rejected}`,
+      `- Umgesetzt: ${data.actions.executed}`
+    );
+
+    return lines.join('\n');
   }
 
   async onStateChange(id, state) {
@@ -1508,7 +1871,7 @@ class AiAutopilot extends utils.Adapter {
       this.log.warn('Telegram chatId fehlt. Nachricht wird ohne chatId gesendet.');
     }
 
-    const { includeKeyboard = false } = options;
+    const { includeKeyboard = false, parseMode } = options;
 
     try {
       if (this.config.debug) {
@@ -1518,6 +1881,9 @@ class AiAutopilot extends utils.Adapter {
         text,
         chatId: this.config.telegram.chatId || undefined
       };
+      if (parseMode) {
+        payload.parse_mode = parseMode;
+      }
 
       if (includeKeyboard) {
         payload.reply_markup = {
@@ -1929,6 +2295,50 @@ class AiAutopilot extends utils.Adapter {
       return null;
     }
     return values.reduce((sum, value) => sum + value, 0);
+  }
+
+  formatWatts(value) {
+    if (!Number.isFinite(value)) {
+      return 'n/a';
+    }
+    if (Math.abs(value) >= 1000) {
+      return `${(value / 1000).toFixed(2)} kW`;
+    }
+    return `${Math.round(value)} W`;
+  }
+
+  formatKwh(value) {
+    if (!Number.isFinite(value)) {
+      return 'n/a';
+    }
+    return `${value.toFixed(1)} kWh`;
+  }
+
+  formatLiters(value) {
+    if (!Number.isFinite(value)) {
+      return 'n/a';
+    }
+    return `${Math.round(value)} l`;
+  }
+
+  formatTemperature(value) {
+    if (!Number.isFinite(value)) {
+      return 'n/a';
+    }
+    return `${value.toFixed(1)} °C`;
+  }
+
+  formatSocRange(minValue, maxValue) {
+    const min = Number.isFinite(minValue) ? Math.round(minValue) : null;
+    const max = Number.isFinite(maxValue) ? Math.round(maxValue) : null;
+    if (min === null && max === null) {
+      return 'n/a';
+    }
+    if (min !== null && max !== null) {
+      return `${min}–${max} %`;
+    }
+    const value = min !== null ? min : max;
+    return `${value} %`;
   }
 
   trimLog(text) {
