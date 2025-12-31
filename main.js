@@ -830,6 +830,8 @@ class AiAutopilot extends utils.Adapter {
         },
         deviations: []
       },
+      historyDecision: null,
+      decisionBasis: null,
       learning: {
         feedback: this.feedbackHistory,
         stats: this.learningStats,
@@ -1133,7 +1135,203 @@ class AiAutopilot extends utils.Adapter {
       this.log.info(`[DEBUG] LIVE TEMPERATURE CONTEXT: ${JSON.stringify(context.live.temperature, null, 2)}`);
     }
 
+    if (this.isHistoryEnabled()) {
+      context.historyDecision = this.buildHistoryDecisionContext({
+        houseConsumption: houseConsumptionAggregate,
+        batterySoc: batterySocAggregate,
+        waterDaily: waterAggregate,
+        outsideTemperature: outsideTempAggregate
+      });
+    }
+    context.decisionBasis = {
+      history: context.historyDecision,
+      explanationHint:
+        'Use these historical decision foundations explicitly for reasoning, deviation analysis, and action justification.'
+    };
+
     return context;
+  }
+
+  isHistoryEnabled() {
+    return Boolean(this.config.history?.influx?.enabled || this.config.history?.mysql?.enabled);
+  }
+
+  buildHistoryDecisionContext(historyAggregates) {
+    const pickNumber = (value) => (Number.isFinite(value) ? value : null);
+    const hasNumbers = (aggregate) => {
+      if (!aggregate) {
+        return false;
+      }
+      return ['avg', 'min', 'max', 'last', 'dayAvg', 'nightAvg'].some((key) =>
+        Number.isFinite(aggregate[key])
+      );
+    };
+    const formatPercent = (value) =>
+      Number.isFinite(value) ? Math.round(value * 10) / 10 : null;
+    const detectTrend = (last, avg) => {
+      if (!Number.isFinite(last) || !Number.isFinite(avg) || avg === 0) {
+        return 'unknown';
+      }
+      if (last > avg * 1.05) {
+        return 'rising';
+      }
+      if (last < avg * 0.95) {
+        return 'falling';
+      }
+      return 'stable';
+    };
+
+    const houseAggregate = historyAggregates?.houseConsumption || null;
+    const batteryAggregate = historyAggregates?.batterySoc || null;
+    const waterAggregate = historyAggregates?.waterDaily || null;
+    const outsideAggregate = historyAggregates?.outsideTemperature || null;
+
+    const houseAvg = pickNumber(houseAggregate?.avg);
+    const houseLast = pickNumber(houseAggregate?.last);
+    const houseNightAvg = pickNumber(houseAggregate?.nightAvg);
+    const deviationPercent = Number.isFinite(houseLast) && Number.isFinite(houseNightAvg) && houseNightAvg !== 0
+      ? formatPercent(((houseLast - houseNightAvg) / houseNightAvg) * 100)
+      : null;
+    const houseTrend = detectTrend(houseLast, houseAvg);
+    let houseDeviationReason = null;
+    if (deviationPercent !== null && Math.abs(deviationPercent) >= 5) {
+      const direction = deviationPercent > 0 ? 'above' : 'below';
+      houseDeviationReason = `Night-time consumption is ${direction} the expected base load by ${Math.abs(
+        deviationPercent
+      )}%.`;
+    }
+    let houseSummary = 'No reliable historical house consumption pattern yet.';
+    if (houseAvg !== null) {
+      houseSummary = houseDeviationReason
+        ? houseDeviationReason
+        : `House consumption is ${houseTrend} compared to its historical average.`;
+    }
+
+    const batteryAvg = pickNumber(batteryAggregate?.avg);
+    const batteryLast = pickNumber(batteryAggregate?.last);
+    let batteryTrend = 'unknown';
+    if (batteryAvg !== null && batteryAvg < 20) {
+      batteryTrend = 'persistently_low';
+    } else {
+      batteryTrend = detectTrend(batteryLast, batteryAvg);
+    }
+    let batterySummary = 'No reliable battery SOC trend yet.';
+    if (batteryAvg !== null) {
+      batterySummary =
+        batteryTrend === 'persistently_low'
+          ? 'Battery SOC has remained critically low on average.'
+          : `Battery SOC is ${batteryTrend} compared to its historical average.`;
+    }
+
+    const waterAvg = pickNumber(waterAggregate?.avg);
+    const waterLast = pickNumber(waterAggregate?.last);
+    const waterDeviation =
+      waterAvg !== null && waterLast !== null ? Math.round((waterLast - waterAvg) * 10) / 10 : null;
+    let waterSummary = 'No reliable daily water usage pattern yet.';
+    if (waterAvg !== null) {
+      if (waterDeviation !== null && Math.abs(waterDeviation) >= 1) {
+        const direction = waterDeviation > 0 ? 'above' : 'below';
+        waterSummary = `Daily water usage is ${direction} its historical average.`;
+      } else {
+        waterSummary = 'Daily water usage aligns with its historical average.';
+      }
+    }
+
+    const outsideAvg = pickNumber(outsideAggregate?.avg);
+    const outsideLast = pickNumber(outsideAggregate?.last);
+    const outsideTrend = detectTrend(outsideLast, outsideAvg);
+    let outsideSummary = 'No reliable outside temperature trend yet.';
+    if (outsideAvg !== null) {
+      outsideSummary = `Outside temperature is ${outsideTrend} compared to its historical average.`;
+    }
+
+    const historyDecision = {
+      energy: {
+        houseConsumption: {
+          avg: houseAvg,
+          dayAvg: pickNumber(houseAggregate?.dayAvg),
+          nightAvg: houseNightAvg,
+          min: pickNumber(houseAggregate?.min),
+          max: pickNumber(houseAggregate?.max),
+          last: houseLast,
+          deviationPercent,
+          deviationReason: houseDeviationReason,
+          trend: houseTrend,
+          summary: houseSummary
+        }
+      },
+      battery: {
+        soc: {
+          avg: batteryAvg,
+          min: pickNumber(batteryAggregate?.min),
+          max: pickNumber(batteryAggregate?.max),
+          last: batteryLast,
+          trend: batteryTrend,
+          summary: batterySummary
+        }
+      },
+      water: {
+        daily: {
+          avg: waterAvg,
+          min: pickNumber(waterAggregate?.min),
+          max: pickNumber(waterAggregate?.max),
+          deviation: waterDeviation,
+          summary: waterSummary
+        }
+      },
+      temperature: {
+        outside: {
+          avg: outsideAvg,
+          min: pickNumber(outsideAggregate?.min),
+          max: pickNumber(outsideAggregate?.max),
+          trend: outsideTrend,
+          summary: outsideSummary
+        }
+      }
+    };
+
+    const hasAnyAggregate =
+      hasNumbers(houseAggregate) ||
+      hasNumbers(batteryAggregate) ||
+      hasNumbers(waterAggregate) ||
+      hasNumbers(outsideAggregate);
+    if (!hasAnyAggregate) {
+      historyDecision.summary =
+        'Historical data is enabled but does not yet provide reliable patterns.';
+    }
+
+    if (this.config.debug) {
+      this.log.info(`[DEBUG] History decision context built: ${JSON.stringify(historyDecision, null, 2)}`);
+      this.log.info(
+        `[DEBUG] History decision deviations: ${JSON.stringify({ deviationPercent, waterDeviation }, null, 2)}`
+      );
+      this.log.info(
+        `[DEBUG] History decision trends: ${JSON.stringify(
+          {
+            houseConsumption: houseTrend,
+            batterySoc: batteryTrend,
+            outsideTemperature: outsideTrend
+          },
+          null,
+          2
+        )}`
+      );
+      this.log.info(
+        `[DEBUG] History decision summaries: ${JSON.stringify(
+          {
+            houseConsumption: houseSummary,
+            batterySoc: batterySummary,
+            waterDaily: waterSummary,
+            outsideTemperature: outsideSummary,
+            summary: historyDecision.summary || null
+          },
+          null,
+          2
+        )}`
+      );
+    }
+
+    return historyDecision;
   }
 
   normalizeHistoryInstance(instance) {
@@ -1483,6 +1681,10 @@ class AiAutopilot extends utils.Adapter {
     if (!this.openaiClient || actions.length === 0) {
       return actions;
     }
+    if (this.isHistoryEnabled() && !context?.decisionBasis?.history) {
+      this.log.warn('History enabled but decision basis missing - skipping GPT refinement.');
+      return actions;
+    }
 
     const payload = {
       context: {
@@ -1492,7 +1694,8 @@ class AiAutopilot extends utils.Adapter {
           pv: context?.live?.pv || [],
           water: context?.live?.water || [],
           temperature: context?.live?.temperature || []
-        }
+        },
+        decisionBasis: context?.decisionBasis || {}
       },
       actions: actions.map((action) => ({
         id: action.id,
@@ -1580,6 +1783,10 @@ class AiAutopilot extends utils.Adapter {
     if (!this.openaiClient) {
       return [];
     }
+    if (this.isHistoryEnabled() && !context?.decisionBasis?.history) {
+      this.log.warn('History enabled but decision basis missing - skipping GPT suggestions.');
+      return [];
+    }
 
     const actionContext = this.buildActionContext(context);
     const payload = {
@@ -1591,7 +1798,7 @@ class AiAutopilot extends utils.Adapter {
           water: context?.live?.water || [],
           temperature: context?.live?.temperature || []
         },
-        history: context?.history || {},
+        decisionBasis: context?.decisionBasis || {},
         learning: {
           feedback: context?.learning?.feedback || [],
           stats: context?.learning?.stats || {}
@@ -1677,6 +1884,10 @@ class AiAutopilot extends utils.Adapter {
     if (!this.openaiClient) {
       return 'OpenAI not configured - GPT analysis skipped.';
     }
+    if (this.isHistoryEnabled() && !context?.decisionBasis?.history) {
+      this.log.warn('History enabled but decision basis missing - skipping GPT insights.');
+      return 'GPT insights not available.';
+    }
 
     const prompt =
       'Du bist ein Assistent für einen Haus-Autopiloten. ' +
@@ -1697,7 +1908,7 @@ class AiAutopilot extends utils.Adapter {
               feedback: context.learning?.feedback || [],
               stats: context.learning?.stats || {}
             },
-            history: context.history || {}
+            decisionBasis: context?.decisionBasis || {}
           }
         },
         null,
