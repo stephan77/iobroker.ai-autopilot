@@ -78,6 +78,12 @@
           "label": "Netzbezug / Einspeisung",
           "help": "Positiv = Bezug, negativ = Einspeisung (W)."
         },
+        "energy.gridPowerThreshold": {
+          "type": "number",
+          "label": "Schwellwert Netzbezug (W)",
+          "help": "Grenzwert für Live-Regel: Netzbezug bei fehlender PV-Erzeugung.",
+          "min": 0
+        },
         "energy.batterySoc": {
           "type": "objectId",
           "label": "Batterie SOC",

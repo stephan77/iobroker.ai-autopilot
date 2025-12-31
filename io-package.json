@@ -25,6 +25,7 @@
     "energy": {
       "houseConsumption": "",
       "gridPower": "",
+      "gridPowerThreshold": 500,
       "batterySoc": "",
       "batteryPower": "",
       "wallbox": "",

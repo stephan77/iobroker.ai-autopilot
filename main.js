@@ -9,6 +9,7 @@ const DAY_MS = 86_400_000;
 const DAY_START_HOUR = 6;
 const NIGHT_START_HOUR = 22;
 const GPT_LOG_TRIM = 800;
+const DEFAULT_GRID_POWER_THRESHOLD = 500;
 
 class AiAutopilot extends utils.Adapter {
   constructor(options = {}) {
@@ -677,8 +678,10 @@ class AiAutopilot extends utils.Adapter {
         }
       }
 
+      context.summary = energySummary;
+      const liveRuleActions = this.buildLiveRuleActions(context);
+
       if (!skipAnalysis) {
-        context.summary = energySummary;
         this.lastContextSummary = this.buildFeedbackContext(context, energySummary);
         const recommendations = this.generateRecommendations(liveData, aggregates, energySummary);
         if (this.config.debug) {
@@ -690,10 +693,18 @@ class AiAutopilot extends utils.Adapter {
           gptInsights = await this.generateGptInsights(context, energySummary, recommendations);
         }
         reportText = this.buildReportText(liveData, aggregates, recommendations, gptInsights, energySummary);
-        const actions = this.buildDeviationActions(context);
-        const refinedActions = await this.refineActionsWithGpt(context.history.deviations, actions);
-        finalActions = this.dedupeActions(refinedActions);
       }
+
+      const historyDeviationActions = this.buildDeviationActions(context);
+      const gptSuggestedActions = await this.refineActionsWithGpt(
+        context.history.deviations,
+        historyDeviationActions
+      );
+      finalActions = this.dedupeActions([
+        ...liveRuleActions,
+        ...historyDeviationActions,
+        ...gptSuggestedActions
+      ]);
 
       lastErrorMessage = '';
     } catch (error) {
@@ -706,7 +717,7 @@ class AiAutopilot extends utils.Adapter {
       await this.setStateAsync('report.last', reportText, true);
       await this.setStateAsync('report.actions', JSON.stringify(finalActions, null, 2), true);
 
-      if (!this.config.dryRun && this.config.telegram.enabled) {
+      if (finalActions.length > 0 && this.config.telegram.enabled) {
         await this.requestApproval(finalActions, reportText);
       }
 
@@ -1656,6 +1667,76 @@ class AiAutopilot extends utils.Adapter {
     return actions;
   }
 
+  buildLiveRuleActions(context) {
+    const actions = [];
+    const baseId = Date.now();
+    let index = 1;
+    const batterySoc = context?.summary?.batterySoc;
+    const outsideTemp = this.getOutsideTemperature(context?.live?.temperature || []);
+    const gridPower = context?.summary?.gridPower;
+    const pvPower = context?.summary?.pvPower;
+    const configuredThreshold = Number(this.config.energy?.gridPowerThreshold);
+    const gridThreshold = Number.isFinite(configuredThreshold)
+      ? configuredThreshold
+      : DEFAULT_GRID_POWER_THRESHOLD;
+
+    if (Number.isFinite(batterySoc) && batterySoc < 20) {
+      actions.push({
+        id: `${baseId}-${index++}`,
+        category: 'battery',
+        type: 'protect_battery',
+        priority: 'high',
+        title: 'Batterie schützen',
+        description: 'Batterie-SOC unter 20 %. Entladung reduzieren oder Reserve schützen.',
+        reason: `Live-Regel: Batterie-SOC ${batterySoc}% < 20%.`,
+        severity: 'high',
+        status: 'proposed',
+        source: 'live',
+        deviationRef: 'live:protect_battery'
+      });
+    }
+
+    if (Number.isFinite(outsideTemp) && outsideTemp < 0) {
+      actions.push({
+        id: `${baseId}-${index++}`,
+        category: 'heating',
+        type: 'check_frost_protection',
+        priority: 'high',
+        title: 'Frostschutz prüfen',
+        description: 'Außentemperatur unter 0 °C. Frostschutz und Heizkreise prüfen.',
+        reason: `Live-Regel: Außentemperatur ${outsideTemp} °C < 0 °C.`,
+        severity: 'high',
+        status: 'proposed',
+        source: 'live',
+        deviationRef: 'live:check_frost_protection'
+      });
+    }
+
+    if (
+      Number.isFinite(gridPower) &&
+      Number.isFinite(pvPower) &&
+      gridPower > gridThreshold &&
+      pvPower === 0
+    ) {
+      actions.push({
+        id: `${baseId}-${index++}`,
+        category: 'energy',
+        type: 'reduce_load',
+        priority: 'medium',
+        title: 'Last reduzieren',
+        description: 'Hoher Netzbezug ohne PV-Erzeugung. Verbraucher prüfen und reduzieren.',
+        reason: `Live-Regel: Netzbezug ${gridPower} W > ${gridThreshold} W bei PV 0.`,
+        severity: 'medium',
+        status: 'proposed',
+        source: 'live',
+        deviationRef: 'live:reduce_load'
+      });
+    }
+
+    this.logDebug('Live rule actions derived', actions);
+    return actions;
+  }
+
   mapDeviationToAction(deviation, context) {
     const type = deviation?.type;
     const category = deviation?.category;
@@ -1759,28 +1840,33 @@ class AiAutopilot extends utils.Adapter {
   isDuplicateAction(action, existing) {
     return existing.some(
       (entry) =>
-        entry.category === action.category &&
-        entry.title === action.title &&
-        entry.deviationRef === action.deviationRef
+        entry.id === action.id ||
+        (entry.category === action.category &&
+          entry.title === action.title &&
+          entry.deviationRef === action.deviationRef)
     );
   }
 
   dedupeActions(actions) {
-    const unique = [];
+    const uniqueMap = new Map();
     for (const action of actions || []) {
-      if (this.isDuplicateAction(action, unique)) {
-        this.logDebug('Duplicate action removed after refinement', action);
+      if (!action) {
         continue;
       }
-      unique.push(action);
+      const key =
+        action.id || `${action.category || 'unknown'}:${action.title || 'action'}:${action.deviationRef || ''}`;
+      if (uniqueMap.has(key)) {
+        this.logDebug('Duplicate action replaced', action);
+      }
+      uniqueMap.set(key, action);
     }
-    return unique;
+    return Array.from(uniqueMap.values());
   }
 
   async requestApproval(actions, reportText) {
     this.pendingActions = actions;
     const approvalText = this.buildApprovalMessage(actions, reportText);
-    await this.sendTelegramMessage(approvalText, { includeKeyboard: true });
+    await this.sendTelegramMessage(approvalText, { includeKeyboard: true, parseMode: 'Markdown' });
   }
 
   async executeActions(actions) {
@@ -1815,15 +1901,25 @@ class AiAutopilot extends utils.Adapter {
 
   buildApprovalMessage(actions, reportText) {
     const analysisLabel = this.buildAnalysisLabel(actions);
-    const timeLabel = new Date().toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' });
+    const timestamp = new Date();
+    const timeLabel = timestamp.toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' });
+    const dateLabel = timestamp.toLocaleDateString('de-DE');
     const modeLabel = this.config.mode || 'auto';
+    const dryRunLabel = this.config.dryRun ? 'Ja' : 'Nein';
     const lines = [
-      '🤖🏠 AI-Autopilot – Entscheidung erforderlich',
+      '🤖🏠 *AI-Autopilot – Entscheidung erforderlich*',
       '',
-      `⚡ Analyse: ${analysisLabel}`,
-      `🕒 ${timeLabel} | Modus: ${modeLabel}`,
+      `🕒 *Zeitstempel:* ${dateLabel} ${timeLabel}`,
+      `🧪 *Dry-Run:* ${dryRunLabel}`,
+      `⚡ *Analyse:* ${analysisLabel}`,
+      `⚙️ *Modus:* ${modeLabel}`,
       '',
-      '🔎 Vorgeschlagene Maßnahmen:',
+      '📝 *Zusammenfassung:*',
+      '```',
+      reportText || 'Keine Zusammenfassung verfügbar.',
+      '```',
+      '',
+      '🔎 *Vorgeschlagene Maßnahmen:*',
       ''
     ];
 
@@ -1831,7 +1927,7 @@ class AiAutopilot extends utils.Adapter {
       lines.push(this.formatActionLine(action));
     }
 
-    lines.push('', 'Bitte auswählen:');
+    lines.push('', '_Bitte auswählen:_');
     return lines.join('\n');
   }
 
@@ -1865,10 +1961,6 @@ class AiAutopilot extends utils.Adapter {
   }
 
   async sendTelegramMessage(text, options = {}) {
-    if (this.config.dryRun) {
-      return;
-    }
-
     if (!this.config.telegram.enabled || !this.config.telegram.instance) {
       if (this.config.debug && this.config.telegram.enabled) {
         this.log.info('[DEBUG] Telegram enabled but instance missing.');
@@ -1897,9 +1989,9 @@ class AiAutopilot extends utils.Adapter {
       if (includeKeyboard) {
         payload.reply_markup = {
           inline_keyboard: [
-            [{ text: '✅ Alle umsetzen', callback_data: 'approve_all' }],
-            [{ text: '❌ Alle ablehnen', callback_data: 'reject_all' }],
-            [{ text: '✏️ Anpassen', callback_data: 'modify' }]
+            [{ text: '✅ JA', callback_data: 'approve_all' }],
+            [{ text: '❌ NEIN', callback_data: 'reject_all' }],
+            [{ text: '✏️ ÄNDERN', callback_data: 'modify' }]
           ]
         };
       }
@@ -1996,10 +2088,11 @@ class AiAutopilot extends utils.Adapter {
 
   formatActionLine(action) {
     const severity = String(action.severity || 'info').toUpperCase();
+    const categoryEmoji = this.getCategoryEmoji(action.category);
     const emoji = this.getSeverityEmoji(action.severity);
     const title = action.title || 'Aktion';
     const description = action.description ? ` (${action.description})` : '';
-    return `- ${emoji} [${severity}] ${title}${description}`;
+    return `- ${categoryEmoji} ${emoji} *${title}*${description} _[${severity}]_`;
   }
 
   getSeverityEmoji(severity) {
@@ -2012,6 +2105,25 @@ class AiAutopilot extends utils.Adapter {
         return '⚠️';
       default:
         return 'ℹ️';
+    }
+  }
+
+  getCategoryEmoji(category) {
+    switch (String(category || '').toLowerCase()) {
+      case 'energy':
+        return '⚡';
+      case 'heating':
+        return '🔥';
+      case 'water':
+        return '💧';
+      case 'pv':
+        return '☀️';
+      case 'battery':
+        return '🔋';
+      case 'comfort':
+        return '🛋️';
+      default:
+        return '📌';
     }
   }
 
