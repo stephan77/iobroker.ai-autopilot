@@ -64,6 +64,65 @@
         }
       }
     },
+    "reportsNotifications": {
+      "type": "tab",
+      "label": "Reports & Notifications",
+      "items": {
+        "dailyReportEnabled": {
+          "type": "checkbox",
+          "label": "Daily Report aktivieren",
+          "default": false
+        },
+        "dailyReportTime": {
+          "type": "time",
+          "label": "Uhrzeit",
+          "default": "19:00",
+          "hidden": "!dailyReportEnabled"
+        },
+        "dailyReportDays": {
+          "type": "multiselect",
+          "label": "Wochentage",
+          "hidden": "!dailyReportEnabled",
+          "default": [
+            1,
+            2,
+            3,
+            4,
+            5
+          ],
+          "options": [
+            {
+              "label": "Sonntag",
+              "value": 0
+            },
+            {
+              "label": "Montag",
+              "value": 1
+            },
+            {
+              "label": "Dienstag",
+              "value": 2
+            },
+            {
+              "label": "Mittwoch",
+              "value": 3
+            },
+            {
+              "label": "Donnerstag",
+              "value": 4
+            },
+            {
+              "label": "Freitag",
+              "value": 5
+            },
+            {
+              "label": "Samstag",
+              "value": 6
+            }
+          ]
+        }
+      }
+    },
     "dailyReport": {
       "type": "tab",
       "label": "Daily Report",
