@@ -287,9 +287,6 @@ class AiAutopilot extends utils.Adapter {
         await this.setStateAsync('info.lastError', '', true);
         return;
       }
-      if (this.config.debug) {
-        this.log.info(`[DEBUG] Live energy context: ${JSON.stringify(context.live.energy, null, 2)}`);
-      }
       const energySummary = this.buildEnergySummary(context.live.energy);
       if (this.config.debug) {
         this.log.info(`[DEBUG] Energy summary: ${JSON.stringify(energySummary, null, 2)}`);
@@ -378,7 +375,7 @@ class AiAutopilot extends utils.Adapter {
         energy: [],
         pv: [],
         water: [],
-        temperatures: [],
+        temperature: [],
         heaters: []
       },
       history: {
@@ -388,31 +385,53 @@ class AiAutopilot extends utils.Adapter {
       semantics: {}
     };
 
+    const readSingleValue = async (id) => {
+      if (!id) {
+        return null;
+      }
+      try {
+        const state = await this.getForeignStateAsync(id);
+        if (!state) {
+          return null;
+        }
+        const value = Number(state.val);
+        return Number.isFinite(value) ? value : null;
+      } catch (error) {
+        this.handleError(`Konnte State nicht lesen: ${id}`, error, true);
+        return null;
+      }
+    };
+
     const singleEnergyMappings = [
       {
         id: this.config.energy?.houseConsumption,
         role: 'houseConsumption',
-        description: 'House consumption'
+        description: 'House consumption',
+        unit: 'W'
       },
       {
         id: this.config.energy?.gridPower,
         role: 'gridPower',
-        description: 'Grid power'
+        description: 'Grid power',
+        unit: 'W'
       },
       {
         id: this.config.energy?.batterySoc,
         role: 'batterySoc',
-        description: 'Battery SOC'
+        description: 'Battery SOC',
+        unit: '%'
       },
       {
         id: this.config.energy?.batteryPower,
         role: 'batteryPower',
-        description: 'Battery power'
+        description: 'Battery power',
+        unit: 'W'
       },
       {
         id: this.config.energy?.wallbox,
         role: 'wallbox',
-        description: 'Wallbox'
+        description: 'Wallbox',
+        unit: 'W'
       }
     ];
 
@@ -420,12 +439,13 @@ class AiAutopilot extends utils.Adapter {
       if (!entry.id) {
         continue;
       }
-      const value = await this.getForeignStateValue(entry.id);
+      const value = await readSingleValue(entry.id);
       context.live.energy.push({
         value: value ?? null,
-        unit: '',
+        unit: entry.unit,
         role: entry.role,
-        description: entry.description
+        description: entry.description,
+        source: 'single'
       });
     }
 
@@ -490,46 +510,66 @@ class AiAutopilot extends utils.Adapter {
       });
     }
 
-    for (const room of this.config.rooms || []) {
+    const waterMappings = [
+      {
+        id: this.config.water?.total,
+        role: 'waterTotal'
+      },
+      {
+        id: this.config.water?.hot ?? this.config.water?.hotWater,
+        role: 'waterHot'
+      },
+      {
+        id: this.config.water?.cold ?? this.config.water?.coldWater,
+        role: 'waterCold'
+      },
+      {
+        id: this.config.water?.flow,
+        role: 'waterFlow'
+      }
+    ];
+
+    for (const entry of waterMappings) {
+      if (!entry.id) {
+        continue;
+      }
+      const value = await readSingleValue(entry.id);
+      context.live.water.push({
+        role: entry.role,
+        value: value ?? null,
+        unit: '',
+        source: 'single'
+      });
+    }
+
+    const roomConfigs = this.config.temperature?.rooms || this.config.rooms || [];
+    for (const room of roomConfigs) {
       if (!room) {
         continue;
       }
+      const roomEntry = {
+        role: 'room',
+        name: room.name || ''
+      };
       if (room.temperature) {
-        const value = await this.getForeignStateValue(room.temperature);
-        context.live.temperatures.push({
-          value: value ?? null,
-          unit: '°C',
-          role: 'roomTemperature',
-          description: room.name || ''
-        });
+        roomEntry.temperature = await readSingleValue(room.temperature);
+      } else {
+        roomEntry.temperature = null;
       }
       if (room.target) {
-        const value = await this.getForeignStateValue(room.target);
-        context.live.temperatures.push({
-          value: value ?? null,
-          unit: '°C',
-          role: 'targetTemperature',
-          description: room.name || ''
-        });
+        roomEntry.target = await readSingleValue(room.target);
       }
       if (room.heatingPower) {
-        const value = await this.getForeignStateValue(room.heatingPower);
-        context.live.temperatures.push({
-          value: value ?? null,
-          unit: '',
-          role: 'roomHeatingPower',
-          description: room.name || ''
-        });
+        roomEntry.heatingPower = await readSingleValue(room.heatingPower);
       }
+      context.live.temperature.push(roomEntry);
     }
 
     if (this.config.temperature?.outside) {
-      const value = await this.getForeignStateValue(this.config.temperature.outside);
-      context.live.temperatures.push({
-        value: value ?? null,
-        unit: '°C',
-        role: 'outsideTemperature',
-        description: 'Außentemperatur'
+      const value = await readSingleValue(this.config.temperature.outside);
+      context.live.temperature.push({
+        role: 'outside',
+        temperature: value ?? null
       });
     }
 
@@ -548,6 +588,12 @@ class AiAutopilot extends utils.Adapter {
 
     context.history.influx = this.config.history?.influx?.enabled ? aggregates.influx : {};
     context.history.mysql = this.config.history?.mysql?.enabled ? aggregates.mysql : {};
+
+    if (this.config.debug) {
+      this.log.info(`[DEBUG] LIVE ENERGY CONTEXT: ${JSON.stringify(context.live.energy, null, 2)}`);
+      this.log.info(`[DEBUG] LIVE WATER CONTEXT: ${JSON.stringify(context.live.water, null, 2)}`);
+      this.log.info(`[DEBUG] LIVE TEMPERATURE CONTEXT: ${JSON.stringify(context.live.temperature, null, 2)}`);
+    }
 
     return context;
   }
@@ -622,7 +668,7 @@ class AiAutopilot extends utils.Adapter {
 
   redactContext(context) {
     const clone = JSON.parse(JSON.stringify(context));
-    const sections = ['energy', 'pv', 'water', 'temperatures', 'heaters'];
+    const sections = ['energy', 'pv', 'water', 'temperature', 'heaters'];
     for (const section of sections) {
       for (const entry of clone.live[section] || []) {
         if (Object.prototype.hasOwnProperty.call(entry, 'value')) {
