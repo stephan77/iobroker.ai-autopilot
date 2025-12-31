@@ -2,12 +2,8 @@
   "name": "iobroker.ai-autopilot",
   "version": "0.5.8",
   "main": "main.js",
-  "license": "MIT",
   "dependencies": {
     "@iobroker/adapter-core": "^3.2.3",
     "openai": "^4.0.0"
-  },
-  "overrides": {
-    "bluetooth-hci-socket": false
-  }  
+  }
 }
