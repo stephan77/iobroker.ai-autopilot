@@ -26,6 +26,8 @@ class AiAutopilot extends utils.Adapter {
     this.openaiClient = null;
     this.feedbackHistory = [];
     this.learningHistory = [];
+    this.learningHistoryEntries = [];
+    this.learningStats = {};
     this.lastContextSummary = null;
     this.awaitingTelegramInput = false;
   }
@@ -46,9 +48,11 @@ class AiAutopilot extends utils.Adapter {
       this.subscribeStates('control.run');
       this.subscribeStates('memory.feedback');
       this.subscribeStates('memory.learning');
+      this.subscribeStates('memory.history');
 
       await this.loadFeedbackHistory();
       await this.loadLearningHistory();
+      await this.loadLearningHistoryEntries();
       this.startScheduler();
 
       this.log.info('AI Autopilot v0.5.8 ready');
@@ -162,6 +166,18 @@ class AiAutopilot extends utils.Adapter {
     });
 
     await this.setObjectNotExistsAsync('memory.learning', {
+      type: 'state',
+      common: {
+        type: 'string',
+        role: 'text',
+        read: true,
+        write: true,
+        def: ''
+      },
+      native: {}
+    });
+
+    await this.setObjectNotExistsAsync('memory.history', {
       type: 'state',
       common: {
         type: 'string',
@@ -732,6 +748,9 @@ class AiAutopilot extends utils.Adapter {
     } finally {
       await this.setStateAsync('report.last', reportText, true);
       await this.setStateAsync('report.actions', JSON.stringify(finalActions, null, 2), true);
+      if (this.config.debug) {
+        this.log.info(`[DEBUG] Saved actions: ${JSON.stringify(finalActions, null, 2)}`);
+      }
 
       if (finalActions.length > 0) {
         this.logDebug('Telegram send triggered', { actions: finalActions.length });
@@ -785,6 +804,8 @@ class AiAutopilot extends utils.Adapter {
   async buildContext(liveData, aggregates) {
     await this.loadFeedbackHistory();
     await this.loadLearningHistory();
+    await this.loadLearningHistoryEntries();
+    this.learningStats = this.aggregateLearningStats(this.learningHistoryEntries);
     const context = {
       timestamp: new Date().toISOString(),
       mode: this.config.mode,
@@ -811,6 +832,7 @@ class AiAutopilot extends utils.Adapter {
       },
       learning: {
         feedback: this.feedbackHistory,
+        stats: this.learningStats,
         entries: this.learningHistory
       },
       semantics: {}
@@ -1098,6 +1120,12 @@ class AiAutopilot extends utils.Adapter {
     }
 
     context.history.deviations = deviations;
+    const totalHistoryPoints =
+      (aggregates.influx || []).length + (aggregates.mysql || []).length;
+    if (totalHistoryPoints === 0) {
+      context.history.notice =
+        'Keine historischen Daten verfügbar (InfluxDB/SQL). Bitte History-Adapter prüfen.';
+    }
 
     if (this.config.debug) {
       this.log.info(`[DEBUG] LIVE ENERGY CONTEXT: ${JSON.stringify(context.live.energy, null, 2)}`);
@@ -1108,8 +1136,31 @@ class AiAutopilot extends utils.Adapter {
     return context;
   }
 
+  normalizeHistoryInstance(instance) {
+    if (!instance) {
+      return null;
+    }
+    if (instance.startsWith('mysql.')) {
+      const mapped = instance.replace(/^mysql\./, 'sql.');
+      if (this.config.debug) {
+        this.log.info(`[DEBUG] History instance mapped from ${instance} to ${mapped}`);
+      }
+      return mapped;
+    }
+    if (instance.startsWith('sql.') || instance.startsWith('influxdb.')) {
+      return instance;
+    }
+    return null;
+  }
+
   async collectHistoryFromConfig(historyConfig, baseUnitMs) {
     if (!historyConfig || !historyConfig.enabled || !historyConfig.instance) {
+      return { series: [], pointsLoaded: 0 };
+    }
+
+    const instance = this.normalizeHistoryInstance(historyConfig.instance);
+    if (!instance) {
+      this.log.warn(`History instance "${historyConfig.instance}" nicht unterstützt (nur influxdb.* oder sql.*).`);
       return { series: [], pointsLoaded: 0 };
     }
 
@@ -1147,7 +1198,7 @@ class AiAutopilot extends utils.Adapter {
       if (!id) {
         continue;
       }
-      const data = await this.requestHistoryWithTimeout(historyConfig.instance, id, options);
+      const data = await this.requestHistoryWithTimeout(instance, id, options);
       const values = this.normalizeHistoryValues(data);
       pointsLoaded += values.length;
       results.push({
@@ -1155,6 +1206,10 @@ class AiAutopilot extends utils.Adapter {
         id,
         values
       });
+    }
+
+    if (this.config.debug) {
+      this.log.info(`[DEBUG] History source used: ${instance}`);
     }
 
     return { series: results, pointsLoaded };
@@ -1536,10 +1591,10 @@ class AiAutopilot extends utils.Adapter {
           water: context?.live?.water || [],
           temperature: context?.live?.temperature || []
         },
-        history: context?.history?.deviations || [],
+        history: context?.history || {},
         learning: {
           feedback: context?.learning?.feedback || [],
-          decisions: context?.learning?.entries || []
+          stats: context?.learning?.stats || {}
         }
       },
       schema: {
@@ -1639,9 +1694,11 @@ class AiAutopilot extends utils.Adapter {
             },
             recommendations,
             learning: {
-              feedback: context.learning?.feedback || []
-            }
-          },
+              feedback: context.learning?.feedback || [],
+              stats: context.learning?.stats || {}
+            },
+            history: context.history || {}
+          }
         },
         null,
         2
@@ -1849,7 +1906,7 @@ class AiAutopilot extends utils.Adapter {
         value: mapping.value,
         unit: mapping.unit,
         priority: mapping.priority || this.mapDeviationPriority(deviation.severity),
-        source: 'history',
+        source: 'deviation',
         reason: mapping.reason,
         context: actionContext,
         requiresApproval: mapping.requiresApproval ?? true,
@@ -2109,9 +2166,18 @@ class AiAutopilot extends utils.Adapter {
   }
 
   async requestApproval(actions, reportText) {
-    this.pendingActions = actions;
+    const sentActions = this.markActionsSent(actions);
+    this.pendingActions = sentActions;
+    await this.setStateAsync('report.actions', JSON.stringify(sentActions, null, 2), true);
+    if (this.config.debug) {
+      this.log.info(`[DEBUG] Saved actions: ${JSON.stringify(sentActions, null, 2)}`);
+    }
     const approvalText = this.buildApprovalMessage(actions, reportText);
-    await this.sendTelegramMessage(approvalText, { includeKeyboard: true, parseMode: 'Markdown' });
+    await this.sendTelegramMessage(approvalText, {
+      includeKeyboard: true,
+      parseMode: 'Markdown',
+      actions: actions
+    });
   }
 
   async executeActions(actions) {
@@ -2144,6 +2210,9 @@ class AiAutopilot extends utils.Adapter {
     );
     await this.storeLearningEntries(
       approvedActions.map((action) => this.buildLearningEntry(action, 'approved'))
+    );
+    await this.storeLearningHistoryEntries(
+      approvedActions.map((action) => this.buildLearningHistoryEntry(action, 'executed'))
     );
   }
 
@@ -2183,6 +2252,30 @@ class AiAutopilot extends utils.Adapter {
     for (const action of actions) {
       action.status = status;
     }
+  }
+
+  markActionsSent(actions) {
+    for (const action of actions) {
+      if (action.status === 'proposed') {
+        action.status = 'sent';
+      }
+    }
+    return actions;
+  }
+
+  buildTelegramKeyboard(actions) {
+    const keyboard = [];
+    for (const action of actions || []) {
+      if (!action || !action.id) {
+        continue;
+      }
+      keyboard.push([
+        { text: '✅ Freigeben', callback_data: `action:${action.id}:approved` },
+        { text: '❌ Ablehnen', callback_data: `action:${action.id}:rejected` },
+        { text: '✅ Ausgeführt', callback_data: `action:${action.id}:executed` }
+      ]);
+    }
+    return keyboard.length > 0 ? keyboard : [];
   }
 
   getActionHandlers() {
@@ -2232,7 +2325,7 @@ class AiAutopilot extends utils.Adapter {
       this.log.warn('Telegram chatId fehlt. Nachricht wird ohne chatId gesendet.');
     }
 
-    const { includeKeyboard = false, parseMode } = options;
+    const { includeKeyboard = false, parseMode, actions = [] } = options;
 
     try {
       if (this.config.debug) {
@@ -2248,11 +2341,7 @@ class AiAutopilot extends utils.Adapter {
 
       if (includeKeyboard) {
         payload.reply_markup = {
-          inline_keyboard: [
-            [{ text: '✅ JA', callback_data: 'approve_all' }],
-            [{ text: '❌ NEIN', callback_data: 'reject_all' }],
-            [{ text: '✏️ ÄNDERN', callback_data: 'modify' }]
-          ]
+          inline_keyboard: this.buildTelegramKeyboard(actions)
         };
       }
 
@@ -2265,6 +2354,14 @@ class AiAutopilot extends utils.Adapter {
   async handleTelegramCallback(callbackData) {
     if (this.config.debug) {
       this.log.info(`[DEBUG] Telegram callback received: ${callbackData}`);
+    }
+
+    const actionMatch = String(callbackData || '').match(/^action:(.+):(approved|rejected|executed)$/);
+    if (actionMatch) {
+      const actionId = actionMatch[1];
+      const status = actionMatch[2];
+      await this.updateActionStatusInState(actionId, status);
+      return;
     }
 
     if (!this.pendingActions) {
@@ -2280,13 +2377,6 @@ class AiAutopilot extends utils.Adapter {
     if (callbackData === 'reject_all') {
       await this.finalizeApproval('rejected');
       return;
-    }
-
-    if (callbackData === 'modify') {
-      this.awaitingTelegramInput = true;
-      await this.sendTelegramMessage(
-        '✏️ Bitte sende deinen Änderungswunsch als Text. Ich speichere ihn als Feedback.'
-      );
     }
   }
 
@@ -2310,6 +2400,48 @@ class AiAutopilot extends utils.Adapter {
     }
   }
 
+  async loadActionsFromState() {
+    const state = await this.getStateAsync('report.actions');
+    if (!state || !state.val) {
+      return [];
+    }
+    try {
+      const parsed = JSON.parse(String(state.val));
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (error) {
+      this.handleError('Gespeicherte Aktionen konnten nicht geparst werden', error, true);
+      return [];
+    }
+  }
+
+  async updateActionStatusInState(actionId, status) {
+    const actions = await this.loadActionsFromState();
+    if (actions.length === 0) {
+      this.log.warn('Keine gespeicherten Aktionen für Status-Update gefunden.');
+      return;
+    }
+    const action = actions.find((entry) => entry && String(entry.id) === String(actionId));
+    if (!action) {
+      this.log.warn(`Aktion nicht gefunden für Status-Update: ${actionId}`);
+      return;
+    }
+
+    action.status = status;
+    await this.setStateAsync('report.actions', JSON.stringify(actions, null, 2), true);
+    if (this.pendingActions) {
+      const pending = this.pendingActions.find((entry) => entry && String(entry.id) === String(actionId));
+      if (pending) {
+        pending.status = status;
+      }
+    }
+
+    if (['approved', 'rejected', 'executed'].includes(status)) {
+      const learningEntry = this.buildLearningHistoryEntry(action, status);
+      await this.storeLearningHistoryEntries([learningEntry]);
+      await this.storeLearningEntries([this.buildLearningEntry(action, status)]);
+    }
+  }
+
   async finalizeApproval(decision) {
     if (!this.pendingActions) {
       return;
@@ -2317,6 +2449,9 @@ class AiAutopilot extends utils.Adapter {
 
     if (decision === 'approved') {
       this.updateActionStatuses(this.pendingActions, 'approved');
+      await this.storeLearningHistoryEntries(
+        this.pendingActions.map((action) => this.buildLearningHistoryEntry(action, 'approved'))
+      );
       if (this.config.dryRun) {
         this.log.info('Dry-Run aktiv: Aktionen werden nicht ausgeführt.');
         for (const action of this.pendingActions) {
@@ -2351,6 +2486,9 @@ class AiAutopilot extends utils.Adapter {
       );
       await this.storeLearningEntries(
         this.pendingActions.map((action) => this.buildLearningEntry(action, 'rejected'))
+      );
+      await this.storeLearningHistoryEntries(
+        this.pendingActions.map((action) => this.buildLearningHistoryEntry(action, 'rejected'))
       );
       this.log.info('Aktionen wurden abgelehnt.');
       this.pendingActions = null;
@@ -2788,6 +2926,51 @@ class AiAutopilot extends utils.Adapter {
     }
   }
 
+  async loadLearningHistoryEntries() {
+    try {
+      const existing = await this.getStateAsync('memory.history');
+      if (!existing || !existing.val) {
+        this.learningHistoryEntries = [];
+        return;
+      }
+      const parsed = JSON.parse(String(existing.val));
+      if (Array.isArray(parsed)) {
+        this.learningHistoryEntries = parsed.slice(-500);
+      } else if (parsed && typeof parsed === 'object') {
+        this.learningHistoryEntries = [parsed].slice(-500);
+      } else {
+        this.learningHistoryEntries = [];
+      }
+    } catch (error) {
+      this.learningHistoryEntries = [];
+      this.handleError('Learning History konnte nicht geladen werden', error, true);
+    }
+  }
+
+  aggregateLearningStats(entries) {
+    const stats = {
+      totals: { approved: 0, rejected: 0, executed: 0 },
+      byKey: {}
+    };
+    for (const entry of entries || []) {
+      if (!entry) {
+        continue;
+      }
+      const decision = String(entry.decision || '').toLowerCase();
+      if (!['approved', 'rejected', 'executed'].includes(decision)) {
+        continue;
+      }
+      stats.totals[decision] += 1;
+      const key = entry.learningKey || 'unknown';
+      if (!stats.byKey[key]) {
+        stats.byKey[key] = { approved: 0, rejected: 0, executed: 0, total: 0 };
+      }
+      stats.byKey[key][decision] += 1;
+      stats.byKey[key].total += 1;
+    }
+    return stats;
+  }
+
   buildFeedbackContext(context, energySummary) {
     const timeLabel = new Date(context.timestamp).toLocaleTimeString('de-DE', {
       hour: '2-digit',
@@ -2839,6 +3022,21 @@ class AiAutopilot extends utils.Adapter {
     };
   }
 
+  buildLearningHistoryEntry(action, decision) {
+    const context = action?.context || {};
+    return {
+      learningKey: String(action.learningKey || 'unknown'),
+      actionId: String(action.id || ''),
+      decision,
+      timestamp: new Date().toISOString(),
+      context: {
+        batterySoc: context.batterySoc ?? null,
+        houseConsumption: context.houseConsumption ?? null,
+        outsideTemp: context.outsideTemp ?? null
+      }
+    };
+  }
+
   async storeFeedbackEntries(entries) {
     if (!Array.isArray(entries) || entries.length === 0) {
       return;
@@ -2866,6 +3064,22 @@ class AiAutopilot extends utils.Adapter {
       }
     } catch (error) {
       this.log.warn(`Learning konnte nicht gespeichert werden: ${error.message}`);
+    }
+  }
+
+  async storeLearningHistoryEntries(entries) {
+    if (!Array.isArray(entries) || entries.length === 0) {
+      return;
+    }
+    try {
+      this.learningHistoryEntries = [...this.learningHistoryEntries, ...entries].slice(-500);
+      await this.setStateAsync('memory.history', JSON.stringify(this.learningHistoryEntries, null, 2), true);
+      if (this.config.debug) {
+        this.log.info(`[DEBUG] Learning entries stored (${entries.length} entries)`);
+        this.log.info(`[DEBUG] Learning entries: ${JSON.stringify(entries, null, 2)}`);
+      }
+    } catch (error) {
+      this.log.warn(`Learning History konnte nicht gespeichert werden: ${error.message}`);
     }
   }
 
