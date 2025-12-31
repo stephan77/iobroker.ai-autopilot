@@ -30,6 +30,7 @@ class AiAutopilot extends utils.Adapter {
     this.learningStats = {};
     this.lastContextSummary = null;
     this.awaitingTelegramInput = false;
+    this.pendingModifyActionId = null;
   }
 
   async onReady() {
@@ -627,7 +628,7 @@ class AiAutopilot extends utils.Adapter {
     const text = payload.text || payload?.message?.text;
 
     if (callbackData) {
-      await this.handleTelegramCallback(String(callbackData));
+      await this.handleTelegramCallback({ callbackData: String(callbackData), payload });
       return;
     }
 
@@ -2037,6 +2038,8 @@ class AiAutopilot extends utils.Adapter {
       context: actionContext,
       requiresApproval,
       status: 'proposed',
+      decision: null,
+      timestamps: this.buildActionTimestamps(),
       learningKey,
       title: typeof entry.title === 'string' ? entry.title : this.formatActionTitle(type),
       description: typeof entry.description === 'string' ? entry.description : undefined
@@ -2122,6 +2125,8 @@ class AiAutopilot extends utils.Adapter {
         context: actionContext,
         requiresApproval: mapping.requiresApproval ?? true,
         status: 'proposed',
+        decision: null,
+        timestamps: this.buildActionTimestamps(),
         learningKey: mapping.learningKey || 'deviation_generic',
         title: mapping.title,
         description: mapping.description,
@@ -2169,6 +2174,8 @@ class AiAutopilot extends utils.Adapter {
         context: actionContext,
         requiresApproval: false,
         status: 'proposed',
+        decision: null,
+        timestamps: this.buildActionTimestamps(),
         source: 'live-rule',
         learningKey: 'battery_low',
         deviationRef: 'live:protect_battery'
@@ -2187,6 +2194,8 @@ class AiAutopilot extends utils.Adapter {
         context: actionContext,
         requiresApproval: false,
         status: 'proposed',
+        decision: null,
+        timestamps: this.buildActionTimestamps(),
         source: 'live-rule',
         learningKey: 'frost_risk',
         deviationRef: 'live:check_frost_protection'
@@ -2210,6 +2219,8 @@ class AiAutopilot extends utils.Adapter {
         context: actionContext,
         requiresApproval: true,
         status: 'proposed',
+        decision: null,
+        timestamps: this.buildActionTimestamps(),
         source: 'live-rule',
         learningKey: 'grid_peak',
         deviationRef: 'live:reduce_load'
@@ -2379,10 +2390,7 @@ class AiAutopilot extends utils.Adapter {
   async requestApproval(actions, reportText) {
     const sentActions = this.markActionsSent(actions);
     this.pendingActions = sentActions;
-    await this.setStateAsync('report.actions', JSON.stringify(sentActions, null, 2), true);
-    if (this.config.debug) {
-      this.log.info(`[DEBUG] Saved actions: ${JSON.stringify(sentActions, null, 2)}`);
-    }
+    await this.persistActions(sentActions, 'Pending actions saved');
     const approvalText = this.buildApprovalMessage(actions, reportText);
     await this.sendTelegramMessage(approvalText, {
       includeKeyboard: true,
@@ -2394,26 +2402,11 @@ class AiAutopilot extends utils.Adapter {
   async executeActions(actions) {
     const approvedActions = actions.filter((action) => action.status === 'approved');
     this.log.info(`Aktionen freigegeben: ${approvedActions.length}`);
-    const handlers = this.getActionHandlers();
-
     for (const action of approvedActions) {
-      const handler = handlers[action.category];
-      try {
-        if (!handler) {
-          action.executionResult = { status: 'skipped', reason: 'noHandler' };
-        } else {
-          const result = await handler(action);
-          action.executionResult = result || { status: 'success' };
-        }
-      } catch (error) {
-        action.executionResult = { status: 'error', message: error.message };
-        this.handleError(`Aktion fehlgeschlagen: ${this.describeAction(action)}`, error, true);
-      } finally {
-        action.status = 'executed';
-      }
+      await this.executeAction(action);
     }
 
-    await this.setStateAsync('report.actions', JSON.stringify(actions, null, 2), true);
+    await this.persistActions(actions, 'Actions executed');
     await this.storeFeedbackEntries(
       approvedActions.map((action) =>
         this.buildFeedbackEntry(action, 'approved', action.executionResult)
@@ -2461,15 +2454,14 @@ class AiAutopilot extends utils.Adapter {
 
   updateActionStatuses(actions, status) {
     for (const action of actions) {
-      action.status = status;
+      this.applyActionStatusTransition(action, status);
     }
   }
 
   markActionsSent(actions) {
     for (const action of actions) {
-      if (action.status === 'proposed') {
-        action.status = 'sent';
-      }
+      const normalized = this.normalizeActionForPersistence(action);
+      Object.assign(action, normalized);
     }
     return actions;
   }
@@ -2481,12 +2473,160 @@ class AiAutopilot extends utils.Adapter {
         continue;
       }
       keyboard.push([
-        { text: '✅ Freigeben', callback_data: `action:${action.id}:approved` },
-        { text: '❌ Ablehnen', callback_data: `action:${action.id}:rejected` },
-        { text: '✅ Ausgeführt', callback_data: `action:${action.id}:executed` }
+        { text: '✅ Freigeben', callback_data: `action:${action.id}:approve` },
+        { text: '❌ Ablehnen', callback_data: `action:${action.id}:reject` },
+        { text: '✏️ Ändern', callback_data: `action:${action.id}:modify` }
       ]);
     }
     return keyboard.length > 0 ? keyboard : [];
+  }
+
+  buildActionTimestamps(existing = {}) {
+    const now = new Date().toISOString();
+    return {
+      createdAt: existing.createdAt || now,
+      decidedAt: existing.decidedAt || null,
+      executedAt: existing.executedAt || null
+    };
+  }
+
+  normalizeActionForPersistence(action) {
+    if (!action || typeof action !== 'object') {
+      return action;
+    }
+    const normalizedStatus = this.normalizeActionStatus(action.status);
+    const timestamps = this.buildActionTimestamps(action.timestamps || {});
+    const decision = action.decision ?? null;
+    return {
+      ...action,
+      status: normalizedStatus,
+      decision,
+      timestamps,
+      learningKey: action.learningKey || 'unknown'
+    };
+  }
+
+  normalizeActionStatus(status) {
+    const normalized = String(status || 'proposed').toLowerCase();
+    if (['proposed', 'approved', 'rejected', 'executed', 'failed'].includes(normalized)) {
+      return normalized;
+    }
+    if (normalized === 'sent') {
+      return 'proposed';
+    }
+    return 'proposed';
+  }
+
+  applyActionDecision(action, decision) {
+    if (!action) {
+      return false;
+    }
+    const now = new Date().toISOString();
+    action.decision = decision;
+    action.timestamps = this.buildActionTimestamps(action.timestamps || {});
+    action.timestamps.decidedAt = action.timestamps.decidedAt || now;
+    this.logDebug('Action decision updated', {
+      actionId: action.id,
+      decision
+    });
+    return true;
+  }
+
+  applyActionStatusTransition(action, nextStatus) {
+    if (!action) {
+      return false;
+    }
+    const currentStatus = this.normalizeActionStatus(action.status);
+    const targetStatus = this.normalizeActionStatus(nextStatus);
+    if (!this.isActionTransitionAllowed(currentStatus, targetStatus)) {
+      this.log.warn(
+        `Ungültige Status-Transition für Aktion ${action.id}: ${currentStatus} -> ${targetStatus}`
+      );
+      return false;
+    }
+
+    const now = new Date().toISOString();
+    action.status = targetStatus;
+    action.timestamps = this.buildActionTimestamps(action.timestamps || {});
+
+    if (targetStatus === 'approved') {
+      action.decision = 'approved';
+      action.timestamps.decidedAt = action.timestamps.decidedAt || now;
+    }
+
+    if (targetStatus === 'rejected') {
+      action.decision = 'rejected';
+      action.timestamps.decidedAt = action.timestamps.decidedAt || now;
+    }
+
+    if (targetStatus === 'executed' || targetStatus === 'failed') {
+      action.timestamps.executedAt = action.timestamps.executedAt || now;
+    }
+
+    this.logDebug('Action status changed', {
+      actionId: action.id,
+      from: currentStatus,
+      to: targetStatus
+    });
+    return true;
+  }
+
+  isActionTransitionAllowed(currentStatus, nextStatus) {
+    const transitions = {
+      proposed: ['approved', 'rejected'],
+      approved: ['executed', 'failed'],
+      rejected: [],
+      executed: [],
+      failed: []
+    };
+    if (currentStatus === nextStatus) {
+      return true;
+    }
+    return (transitions[currentStatus] || []).includes(nextStatus);
+  }
+
+  async persistActions(actions, debugLabel) {
+    try {
+      const normalized = (actions || []).map((action) => this.normalizeActionForPersistence(action));
+      await this.setStateAsync('report.actions', JSON.stringify(normalized, null, 2), true);
+      this.logDebug(debugLabel || 'Actions persisted', { count: normalized.length });
+    } catch (error) {
+      this.handleError('Aktionen konnten nicht gespeichert werden', error, true);
+    }
+  }
+
+  async persistLearningForDecision(action, status) {
+    if (!action) {
+      return;
+    }
+    const normalizedStatus = this.normalizeActionStatus(status);
+    if (normalizedStatus === 'rejected') {
+      await this.storeLearningHistoryEntries([this.buildLearningHistoryEntry(action, 'rejected')]);
+      await this.storeLearningEntries([this.buildLearningEntry(action, 'rejected')]);
+    }
+    if (normalizedStatus === 'executed') {
+      await this.storeLearningHistoryEntries([this.buildLearningHistoryEntry(action, 'executed')]);
+      await this.storeLearningEntries([this.buildLearningEntry(action, 'approved')]);
+    }
+  }
+
+  updatePendingAction(action) {
+    if (!this.pendingActions) {
+      return;
+    }
+    const pending = this.pendingActions.find((entry) => entry && String(entry.id) === String(action.id));
+    if (pending) {
+      Object.assign(pending, action);
+    }
+  }
+
+  async storeActionLearningDecision(actionId, decision) {
+    const actions = await this.loadActionsFromState();
+    const action = actions.find((entry) => entry && String(entry.id) === String(actionId));
+    if (!action) {
+      return;
+    }
+    await this.storeLearningEntries([this.buildLearningEntry(action, decision)]);
   }
 
   getActionHandlers() {
@@ -2562,16 +2702,20 @@ class AiAutopilot extends utils.Adapter {
     }
   }
 
-  async handleTelegramCallback(callbackData) {
+  async handleTelegramCallback(input = {}) {
+    const callbackData = typeof input === 'string' ? input : input?.callbackData;
+    const payload = typeof input === 'object' ? input?.payload : undefined;
     if (this.config.debug) {
       this.log.info(`[DEBUG] Telegram callback received: ${callbackData}`);
     }
 
-    const actionMatch = String(callbackData || '').match(/^action:(.+):(approved|rejected|executed)$/);
+    const actionMatch = String(callbackData || '').match(
+      /^action:(.+):(approve|reject|modify|approved|rejected|executed)$/
+    );
     if (actionMatch) {
       const actionId = actionMatch[1];
-      const status = actionMatch[2];
-      await this.updateActionStatusInState(actionId, status);
+      const actionCommand = actionMatch[2];
+      await this.handleActionCallback(actionId, actionCommand, payload);
       return;
     }
 
@@ -2594,11 +2738,15 @@ class AiAutopilot extends utils.Adapter {
   async handleTelegramText(text) {
     if (this.awaitingTelegramInput) {
       this.awaitingTelegramInput = false;
+      const actionId = this.pendingModifyActionId;
+      this.pendingModifyActionId = null;
       this.log.info(`Änderungswunsch: ${text}`);
       if (this.config.debug) {
         this.log.info(`[DEBUG] Telegram modify text received: ${text}`);
       }
-      if (this.pendingActions) {
+      if (actionId) {
+        await this.storeActionLearningDecision(actionId, 'modified');
+      } else if (this.pendingActions) {
         await this.storeLearningEntries(
           this.pendingActions.map((action) => this.buildLearningEntry(action, 'modified'))
         );
@@ -2618,7 +2766,10 @@ class AiAutopilot extends utils.Adapter {
     }
     try {
       const parsed = JSON.parse(String(state.val));
-      return Array.isArray(parsed) ? parsed : [];
+      if (!Array.isArray(parsed)) {
+        return [];
+      }
+      return parsed.map((action) => this.normalizeActionForPersistence(action));
     } catch (error) {
       this.handleError('Gespeicherte Aktionen konnten nicht geparst werden', error, true);
       return [];
@@ -2637,20 +2788,19 @@ class AiAutopilot extends utils.Adapter {
       return;
     }
 
-    action.status = status;
-    await this.setStateAsync('report.actions', JSON.stringify(actions, null, 2), true);
+    const transitionApplied = this.applyActionStatusTransition(action, status);
+    if (!transitionApplied) {
+      return;
+    }
+    await this.persistActions(actions, 'Action status updated');
     if (this.pendingActions) {
       const pending = this.pendingActions.find((entry) => entry && String(entry.id) === String(actionId));
       if (pending) {
-        pending.status = status;
+        this.applyActionStatusTransition(pending, status);
       }
     }
 
-    if (['approved', 'rejected', 'executed'].includes(status)) {
-      const learningEntry = this.buildLearningHistoryEntry(action, status);
-      await this.storeLearningHistoryEntries([learningEntry]);
-      await this.storeLearningEntries([this.buildLearningEntry(action, status)]);
-    }
+    await this.persistLearningForDecision(action, status);
   }
 
   async finalizeApproval(decision) {
@@ -2660,26 +2810,7 @@ class AiAutopilot extends utils.Adapter {
 
     if (decision === 'approved') {
       this.updateActionStatuses(this.pendingActions, 'approved');
-      await this.storeLearningHistoryEntries(
-        this.pendingActions.map((action) => this.buildLearningHistoryEntry(action, 'approved'))
-      );
-      if (this.config.dryRun) {
-        this.log.info('Dry-Run aktiv: Aktionen werden nicht ausgeführt.');
-        for (const action of this.pendingActions) {
-          action.executionResult = { status: 'skipped', reason: 'dryRun' };
-        }
-        await this.setStateAsync('report.actions', JSON.stringify(this.pendingActions, null, 2), true);
-        await this.storeFeedbackEntries(
-          this.pendingActions.map((action) =>
-            this.buildFeedbackEntry(action, 'approved', action.executionResult)
-          )
-        );
-        await this.storeLearningEntries(
-          this.pendingActions.map((action) => this.buildLearningEntry(action, 'approved'))
-        );
-      } else {
-        await this.executeActions(this.pendingActions);
-      }
+      await this.executeActions(this.pendingActions);
       this.pendingActions = null;
       return;
     }
@@ -2689,7 +2820,7 @@ class AiAutopilot extends utils.Adapter {
       for (const action of this.pendingActions) {
         action.executionResult = { status: 'skipped', reason: 'rejected' };
       }
-      await this.setStateAsync('report.actions', JSON.stringify(this.pendingActions, null, 2), true);
+      await this.persistActions(this.pendingActions, 'Actions rejected');
       await this.storeFeedbackEntries(
         this.pendingActions.map((action) =>
           this.buildFeedbackEntry(action, 'rejected', action.executionResult)
@@ -2703,6 +2834,163 @@ class AiAutopilot extends utils.Adapter {
       );
       this.log.info('Aktionen wurden abgelehnt.');
       this.pendingActions = null;
+    }
+  }
+
+  async handleActionCallback(actionId, actionCommand, payload) {
+    const actions = await this.loadActionsFromState();
+    if (actions.length === 0) {
+      this.log.warn('Keine gespeicherten Aktionen für Telegram Callback vorhanden.');
+      return;
+    }
+
+    const action = actions.find((entry) => entry && String(entry.id) === String(actionId));
+    if (!action) {
+      this.log.warn(`Aktion nicht gefunden für Telegram Callback: ${actionId}`);
+      return;
+    }
+
+    const normalizedCommand = this.normalizeActionCommand(actionCommand);
+    if (!normalizedCommand) {
+      this.log.warn(`Unbekanntes Telegram Kommando: ${actionCommand}`);
+      return;
+    }
+
+    if (normalizedCommand === 'modify') {
+      this.applyActionDecision(action, 'modified');
+      await this.persistActions(actions, 'Action modification requested');
+      this.awaitingTelegramInput = true;
+      this.pendingModifyActionId = actionId;
+      await this.sendTelegramActionConfirmation(action, 'modified');
+      await this.updateTelegramOriginalMessage(payload, '✏️ Modification requested');
+      await this.storeActionLearningDecision(actionId, 'modified');
+      return;
+    }
+
+    if (normalizedCommand === 'reject') {
+      const transitioned = this.applyActionStatusTransition(action, 'rejected');
+      if (!transitioned) {
+        return;
+      }
+      action.executionResult = { status: 'skipped', reason: 'rejected' };
+      await this.persistActions(actions, 'Action rejected');
+      await this.sendTelegramActionConfirmation(action, 'rejected');
+      await this.updateTelegramOriginalMessage(payload, '❌ Rejected');
+      await this.storeFeedbackEntries([this.buildFeedbackEntry(action, 'rejected', action.executionResult)]);
+      await this.persistLearningForDecision(action, 'rejected');
+      this.updatePendingAction(action);
+      return;
+    }
+
+    if (normalizedCommand === 'approve') {
+      const transitioned = this.applyActionStatusTransition(action, 'approved');
+      if (!transitioned) {
+        return;
+      }
+      await this.executeAction(action);
+      await this.persistActions(actions, 'Action approved');
+      await this.sendTelegramActionConfirmation(action, 'approved');
+      await this.updateTelegramOriginalMessage(payload, '✅ Approved');
+      await this.storeFeedbackEntries([this.buildFeedbackEntry(action, 'approved', action.executionResult)]);
+      await this.persistLearningForDecision(action, 'executed');
+      this.updatePendingAction(action);
+      return;
+    }
+
+    if (normalizedCommand === 'executed') {
+      const transitioned = this.applyActionStatusTransition(action, 'executed');
+      if (!transitioned) {
+        return;
+      }
+      await this.persistActions(actions, 'Action executed');
+      await this.sendTelegramActionConfirmation(action, 'executed');
+      await this.updateTelegramOriginalMessage(payload, '✅ Executed');
+      await this.storeFeedbackEntries([this.buildFeedbackEntry(action, 'approved', action.executionResult)]);
+      await this.persistLearningForDecision(action, 'executed');
+      this.updatePendingAction(action);
+    }
+  }
+
+  normalizeActionCommand(actionCommand) {
+    switch (String(actionCommand || '').toLowerCase()) {
+      case 'approve':
+      case 'approved':
+        return 'approve';
+      case 'reject':
+      case 'rejected':
+        return 'reject';
+      case 'modify':
+        return 'modify';
+      case 'executed':
+        return 'executed';
+      default:
+        return null;
+    }
+  }
+
+  async sendTelegramActionConfirmation(action, decision) {
+    const actionLabel = this.describeAction(action);
+    const prefixMap = {
+      approved: '✅ Approved',
+      rejected: '❌ Rejected',
+      modified: '✏️ Modification requested',
+      executed: '✅ Executed'
+    };
+    const prefix = prefixMap[decision] || 'ℹ️ Update';
+    const text = `${prefix}: ${actionLabel}`;
+    await this.sendTelegramMessage(text);
+  }
+
+  async updateTelegramOriginalMessage(payload, updateLabel) {
+    if (!payload || !payload.message || !payload.message.message_id) {
+      return;
+    }
+    if (!this.config.telegram.enabled || !this.config.telegram.instance) {
+      return;
+    }
+    const messageId = payload.message.message_id;
+    const chatId = payload.message.chat?.id || this.config.telegram.chatId;
+    const originalText = payload.message.text || '';
+    if (!originalText) {
+      return;
+    }
+    const updatedText = `${originalText}\n\n${updateLabel}`;
+    try {
+      this.sendTo(this.config.telegram.instance, 'editMessageText', {
+        chatId,
+        message_id: messageId,
+        text: updatedText,
+        parse_mode: 'Markdown'
+      });
+      this.logDebug('Telegram message updated', { messageId, updateLabel });
+    } catch (error) {
+      this.handleError('Telegram message update failed', error, true);
+    }
+  }
+
+  async executeAction(action) {
+    const handlers = this.getActionHandlers();
+    const handler = handlers[action.category];
+    this.logDebug('Action execution intent', {
+      actionId: action.id,
+      description: this.describeAction(action),
+      dryRun: this.config.dryRun
+    });
+
+    try {
+      if (this.config.dryRun) {
+        action.executionResult = { status: 'skipped', reason: 'dryRun' };
+      } else if (!handler) {
+        action.executionResult = { status: 'skipped', reason: 'noHandler' };
+      } else {
+        const result = await handler(action);
+        action.executionResult = result || { status: 'success' };
+      }
+      this.applyActionStatusTransition(action, 'executed');
+    } catch (error) {
+      action.executionResult = { status: 'error', message: error.message };
+      this.applyActionStatusTransition(action, 'failed');
+      this.handleError(`Aktion fehlgeschlagen: ${this.describeAction(action)}`, error, true);
     }
   }
 
@@ -3223,12 +3511,14 @@ class AiAutopilot extends utils.Adapter {
       learningKey: String(action.learningKey || 'unknown'),
       actionType: String(action.type || 'unknown'),
       userDecision,
+      decision: userDecision,
       context: {
         timeOfDay,
         batterySoc: context.batterySoc ?? null,
         outsideTemp: context.outsideTemp ?? null,
         pvPower: context.pvPower ?? null
       },
+      contextSnapshot: { ...context },
       timestamp: new Date().toISOString()
     };
   }
