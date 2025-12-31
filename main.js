@@ -320,9 +320,9 @@ class AiAutopilot extends utils.Adapter {
         this.log.info(`[DEBUG] Context built: ${JSON.stringify(this.redactContext(context))}`);
       }
 
-      let gptInsights = null;
-      if (!this.openaiClient) {
-        gptInsights = 'OpenAI not configured - GPT analysis skipped.';
+      let gptInsights = 'OpenAI not configured - GPT analysis skipped.';
+      if (this.openaiClient) {
+        gptInsights = await this.generateGptInsights(context, energySummary, recommendations);
       }
       const reportText = this.buildReportText(liveData, aggregates, recommendations, gptInsights, energySummary);
       const actions = this.buildDeviationActions(context);
@@ -339,6 +339,10 @@ class AiAutopilot extends utils.Adapter {
       await this.setStateAsync('info.lastError', '', true);
     } catch (error) {
       this.handleError('Analyse fehlgeschlagen', error);
+    } finally {
+      if (this.config.debug) {
+        this.log.info('[DEBUG] Analysis finished');
+      }
     }
   }
 
@@ -738,14 +742,8 @@ class AiAutopilot extends utils.Adapter {
       if (!id) {
         continue;
       }
-      let values = [];
-      try {
-        const data = await this.requestHistory(historyConfig.instance, id, options);
-        values = this.normalizeHistoryValues(data);
-      } catch (error) {
-        this.handleError(`Historische Daten konnten nicht geladen werden: ${id}`, error, true);
-        values = [];
-      }
+      const data = await this.requestHistoryWithTimeout(historyConfig.instance, id, options);
+      const values = this.normalizeHistoryValues(data);
       pointsLoaded += values.length;
       results.push({
         ...datapoint,
@@ -822,6 +820,37 @@ class AiAutopilot extends utils.Adapter {
         resolve((result && result.result) || []);
       });
     });
+  }
+
+  async requestHistoryWithTimeout(instance, id, options, timeoutMs = 10000) {
+    let timeoutId;
+    const timeoutPromise = new Promise((resolve) => {
+      timeoutId = setTimeout(() => resolve({ timeout: true, data: [] }), timeoutMs);
+    });
+
+    try {
+      const result = await Promise.race([
+        this.requestHistory(instance, id, options).then((data) => ({ timeout: false, data })),
+        timeoutPromise
+      ]);
+
+      if (result.timeout) {
+        this.log.warn(`Historische Datenabfrage Timeout (${timeoutMs} ms): ${id}`);
+        if (this.config.debug) {
+          this.log.info(`[DEBUG] History request timed out for ${id}`);
+        }
+        return [];
+      }
+
+      return result.data || [];
+    } catch (error) {
+      this.log.warn(`Historische Daten konnten nicht geladen werden: ${id} (${error.message})`);
+      return [];
+    } finally {
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+      }
+    }
   }
 
   aggregateData(historyData) {
@@ -971,6 +1000,25 @@ class AiAutopilot extends utils.Adapter {
     return series && series.aggregate ? series.aggregate[field] : null;
   }
 
+  async withTimeout(promise, timeoutMs, label) {
+    let timeoutId;
+    const timeoutPromise = new Promise((_, reject) => {
+      timeoutId = setTimeout(() => {
+        const error = new Error(`${label} timeout after ${timeoutMs} ms`);
+        error.code = 'ETIMEDOUT';
+        reject(error);
+      }, timeoutMs);
+    });
+
+    try {
+      return await Promise.race([promise, timeoutPromise]);
+    } finally {
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+      }
+    }
+  }
+
   async refineActionsWithGpt(deviations, actions) {
     if (!this.openaiClient || actions.length === 0) {
       return actions;
@@ -1000,20 +1048,24 @@ class AiAutopilot extends utils.Adapter {
       if (this.config.debug) {
         this.log.info('[DEBUG] GPT action refinement request sent');
       }
-      const response = await this.openaiClient.responses.create({
-        model: this.config.model || 'gpt-4o',
-        input: [
-          {
-            role: 'user',
-            content: [
-              {
-                type: 'input_text',
-                text: prompt
-              }
-            ]
-          }
-        ]
-      });
+      const response = await this.withTimeout(
+        this.openaiClient.responses.create({
+          model: this.config.model || 'gpt-4o',
+          input: [
+            {
+              role: 'user',
+              content: [
+                {
+                  type: 'input_text',
+                  text: prompt
+                }
+              ]
+            }
+          ]
+        }),
+        15000,
+        'GPT action refinement'
+      );
 
       const outputText = response.output_text || this.extractOutputText(response);
       if (this.config.debug) {
@@ -1050,8 +1102,67 @@ class AiAutopilot extends utils.Adapter {
       this.logDebug('GPT action refinement applied', updatedActions);
       return updatedActions;
     } catch (error) {
-      this.handleError('OpenAI Aktionstext-Verfeinerung fehlgeschlagen', error, true);
+      this.log.warn(`GPT Aktionstext-Verfeinerung fehlgeschlagen: ${error.message}`);
       return actions;
+    }
+  }
+
+  async generateGptInsights(context, energySummary, recommendations) {
+    if (!this.openaiClient) {
+      return 'OpenAI not configured - GPT analysis skipped.';
+    }
+
+    const prompt =
+      'Du bist ein Assistent für einen Haus-Autopiloten. ' +
+      'Gib eine kurze, prägnante Zusammenfassung (max. 3 Sätze) mit den wichtigsten Beobachtungen ' +
+      'zu Energie-, Wasser- und Temperaturdaten. Keine Aufzählungen.\n\n' +
+      JSON.stringify(
+        {
+          summary: energySummary,
+          live: {
+            energy: context.live.energy,
+            water: context.live.water,
+            temperature: context.live.temperature
+          },
+          recommendations
+        },
+        null,
+        2
+      );
+
+    try {
+      if (this.config.debug) {
+        this.log.info('[DEBUG] GPT insights request sent');
+      }
+      const response = await this.withTimeout(
+        this.openaiClient.responses.create({
+          model: this.config.model || 'gpt-4o',
+          input: [
+            {
+              role: 'user',
+              content: [
+                {
+                  type: 'input_text',
+                  text: prompt
+                }
+              ]
+            }
+          ]
+        }),
+        15000,
+        'GPT insights'
+      );
+
+      const outputText = response.output_text || this.extractOutputText(response);
+      if (this.config.debug) {
+        this.log.info(`[DEBUG] GPT insights response: ${this.trimLog(outputText || '')}`);
+      }
+      return outputText && outputText.trim()
+        ? outputText.trim()
+        : 'GPT insights not available.';
+    } catch (error) {
+      this.log.warn(`GPT Insights fehlgeschlagen: ${error.message}`);
+      return 'GPT insights not available.';
     }
   }
 
@@ -1393,7 +1504,11 @@ class AiAutopilot extends utils.Adapter {
       return null;
     }
     try {
-      const state = await this.getStateAsync(id);
+      const isLocal = id.startsWith(`${this.namespace}.`) || !id.includes('.');
+      const state = isLocal ? await this.getStateAsync(id) : await this.getForeignStateAsync(id);
+      if (this.config.debug) {
+        this.log.info(`[DEBUG] readState ${isLocal ? 'local' : 'foreign'}: ${id}`);
+      }
       return state ? state.val : null;
     } catch (error) {
       this.handleError(`Konnte State nicht lesen: ${id}`, error, true);
