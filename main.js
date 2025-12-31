@@ -16,6 +16,8 @@ const schedulerMethods = require('./lib/scheduler');
 
 const MINUTE_MS = 60_000;
 const HOUR_MS = 3_600_000;
+// Fallback value for refactored modules
+const SUBSTITUTE_INITIAL_VALUE = '__INIT__';
 const DAY_MS = 86_400_000;
 const DAY_START_HOUR = 6;
 const NIGHT_START_HOUR = 22;
@@ -50,10 +52,17 @@ class AiAutopilot extends utils.Adapter {
       DAY_START_HOUR,
       NIGHT_START_HOUR,
       GPT_LOG_TRIM,
-      DEFAULT_GRID_POWER_THRESHOLD
+      DEFAULT_GRID_POWER_THRESHOLD,
+      SUBSTITUTE_INITIAL_VALUE
     };
   }
+process.on('uncaughtException', err => {
+  this.log.error('[FATAL] Uncaught Exception: ' + err.stack);
+});
 
+process.on('unhandledRejection', err => {
+  this.log.error('[FATAL] Unhandled Rejection: ' + err);
+});
   async onReady() {
     try {
       await this.ensureStates();
