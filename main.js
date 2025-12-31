@@ -25,6 +25,7 @@ class AiAutopilot extends utils.Adapter {
     this.pendingActions = null;
     this.openaiClient = null;
     this.feedbackHistory = [];
+    this.learningHistory = [];
     this.lastContextSummary = null;
     this.awaitingTelegramInput = false;
   }
@@ -44,8 +45,10 @@ class AiAutopilot extends utils.Adapter {
 
       this.subscribeStates('control.run');
       this.subscribeStates('memory.feedback');
+      this.subscribeStates('memory.learning');
 
       await this.loadFeedbackHistory();
+      await this.loadLearningHistory();
       this.startScheduler();
 
       this.log.info('AI Autopilot v0.5.8 ready');
@@ -147,6 +150,18 @@ class AiAutopilot extends utils.Adapter {
     });
 
     await this.setObjectNotExistsAsync('memory.feedback', {
+      type: 'state',
+      common: {
+        type: 'string',
+        role: 'text',
+        read: true,
+        write: true,
+        def: ''
+      },
+      native: {}
+    });
+
+    await this.setObjectNotExistsAsync('memory.learning', {
       type: 'state',
       common: {
         type: 'string',
@@ -665,12 +680,11 @@ class AiAutopilot extends utils.Adapter {
         reportText = 'No energy sources configured – analysis skipped.';
         skipAnalysis = true;
       }
-      let energySummary = this.buildEmptySummary();
+      let energySummary = this.buildEnergySummary(context.live.energy);
+      if (this.config.debug) {
+        this.log.info(`[DEBUG] Energy summary: ${JSON.stringify(energySummary, null, 2)}`);
+      }
       if (!skipAnalysis) {
-        energySummary = this.buildEnergySummary(context.live.energy);
-        if (this.config.debug) {
-          this.log.info(`[DEBUG] Energy summary: ${JSON.stringify(energySummary, null, 2)}`);
-        }
         const missingEnergyValues = this.getMissingEnergyValues(context.live.energy, energySummary);
         if (missingEnergyValues.length > 0) {
           reportText = `Energy summary missing values for roles: ${missingEnergyValues.join(', ')}`;
@@ -696,15 +710,17 @@ class AiAutopilot extends utils.Adapter {
       }
 
       const historyDeviationActions = this.buildDeviationActions(context);
-      const gptSuggestedActions = await this.refineActionsWithGpt(
-        context.history.deviations,
-        historyDeviationActions
-      );
+      const refinedHistoryActions = skipAnalysis
+        ? historyDeviationActions
+        : await this.refineActionsWithGpt(context, historyDeviationActions);
+      const gptSuggestedActions = skipAnalysis ? [] : await this.buildGptSuggestedActions(context);
       finalActions = this.dedupeActions([
         ...liveRuleActions,
-        ...historyDeviationActions,
+        ...refinedHistoryActions,
         ...gptSuggestedActions
       ]);
+
+      this.logDebug('Final merged actions', finalActions);
 
       lastErrorMessage = '';
     } catch (error) {
@@ -717,7 +733,8 @@ class AiAutopilot extends utils.Adapter {
       await this.setStateAsync('report.last', reportText, true);
       await this.setStateAsync('report.actions', JSON.stringify(finalActions, null, 2), true);
 
-      if (finalActions.length > 0 && this.config.telegram.enabled) {
+      if (finalActions.length > 0) {
+        this.logDebug('Telegram send triggered', { actions: finalActions.length });
         await this.requestApproval(finalActions, reportText);
       }
 
@@ -767,6 +784,7 @@ class AiAutopilot extends utils.Adapter {
 
   async buildContext(liveData, aggregates) {
     await this.loadFeedbackHistory();
+    await this.loadLearningHistory();
     const context = {
       timestamp: new Date().toISOString(),
       mode: this.config.mode,
@@ -792,7 +810,8 @@ class AiAutopilot extends utils.Adapter {
         deviations: []
       },
       learning: {
-        feedback: this.feedbackHistory
+        feedback: this.feedbackHistory,
+        entries: this.learningHistory
       },
       semantics: {}
     };
@@ -1405,28 +1424,37 @@ class AiAutopilot extends utils.Adapter {
     }
   }
 
-  async refineActionsWithGpt(deviations, actions) {
+  async refineActionsWithGpt(context, actions) {
     if (!this.openaiClient || actions.length === 0) {
       return actions;
     }
 
     const payload = {
-      deviations,
+      context: {
+        summary: context?.summary,
+        live: {
+          energy: context?.live?.energy || [],
+          pv: context?.live?.pv || [],
+          water: context?.live?.water || [],
+          temperature: context?.live?.temperature || []
+        }
+      },
       actions: actions.map((action) => ({
         id: action.id,
         category: action.category,
+        type: action.type,
+        priority: action.priority,
         title: action.title,
         description: action.description,
         reason: action.reason,
-        severity: action.severity,
-        deviationRef: action.deviationRef
+        learningKey: action.learningKey
       }))
     };
 
     const prompt =
       'Du bist ein Assistent für einen Haus-Autopiloten. Verfeinere ausschließlich die Wortwahl ' +
       'der Aktionsfelder title, description und reason. Erfinde keine neuen Aktionen, ändere keine IDs, ' +
-      'Kategorien, Severity, Status oder Referenzen. Gib ausschließlich ein JSON-Array zurück, in dem ' +
+      'Kategorien, Prioritäten, Status oder Learning Keys. Gib ausschließlich ein JSON-Array zurück, in dem ' +
       'jede Zeile ein Objekt mit id, title, description, reason enthält.\n\n' +
       JSON.stringify(payload, null, 2);
 
@@ -1490,6 +1518,103 @@ class AiAutopilot extends utils.Adapter {
     } catch (error) {
       this.log.warn(`GPT Aktionstext-Verfeinerung fehlgeschlagen: ${error.message}`);
       return actions;
+    }
+  }
+
+  async buildGptSuggestedActions(context) {
+    if (!this.openaiClient) {
+      return [];
+    }
+
+    const actionContext = this.buildActionContext(context);
+    const payload = {
+      context: {
+        summary: context?.summary,
+        live: {
+          energy: context?.live?.energy || [],
+          pv: context?.live?.pv || [],
+          water: context?.live?.water || [],
+          temperature: context?.live?.temperature || []
+        },
+        history: context?.history?.deviations || [],
+        learning: {
+          feedback: context?.learning?.feedback || [],
+          decisions: context?.learning?.entries || []
+        }
+      },
+      schema: {
+        fields: [
+          'id',
+          'category',
+          'type',
+          'target',
+          'value',
+          'unit',
+          'priority',
+          'reason',
+          'requiresApproval',
+          'learningKey'
+        ]
+      }
+    };
+
+    const prompt =
+      'Du bist ein Assistent für einen Haus-Autopiloten. Schlage zusätzliche Aktionen vor, ' +
+      'die auf den Live-Daten basieren. Gib ausschließlich ein JSON-Array zurück. Jede Aktion muss ' +
+      'die Felder id, category (energy|heating|water|pv|safety), type, priority (low|medium|high), reason, ' +
+      'requiresApproval (boolean) und learningKey enthalten. Optional target, value, unit. ' +
+      'Keine Freitexte außerhalb des JSON.\n\n' +
+      JSON.stringify(payload, null, 2);
+
+    try {
+      if (this.config.debug) {
+        this.log.info('[DEBUG] GPT suggested actions request sent');
+      }
+      const response = await this.withTimeout(
+        this.openaiClient.responses.create({
+          model: this.config.model || 'gpt-4o',
+          input: [
+            {
+              role: 'user',
+              content: [
+                {
+                  type: 'input_text',
+                  text: prompt
+                }
+              ]
+            }
+          ]
+        }),
+        15000,
+        'GPT suggested actions'
+      );
+
+      const outputText = response.output_text || this.extractOutputText(response);
+      if (this.config.debug) {
+        this.log.info(`[DEBUG] GPT suggested actions response: ${this.trimLog(outputText || '')}`);
+      }
+
+      const suggestions = this.parseJsonArray(outputText);
+      if (!Array.isArray(suggestions)) {
+        return [];
+      }
+
+      const baseId = Date.now();
+      let index = 1;
+      const actions = [];
+      for (const entry of suggestions) {
+        const normalized = this.normalizeGptAction(entry, actionContext, baseId, index++);
+        if (!normalized) {
+          continue;
+        }
+        actions.push(normalized);
+      }
+
+      this.logDebug('GPT suggested actions derived', actions);
+      return actions;
+    } catch (error) {
+      this.log.warn(`GPT Action-Vorschläge fehlgeschlagen: ${error.message}`);
+      return [];
     }
   }
 
@@ -1589,6 +1714,78 @@ class AiAutopilot extends utils.Adapter {
     }
   }
 
+  buildActionContext(context) {
+    const timestamp = context?.timestamp || new Date().toISOString();
+    const summary = context?.summary || {};
+    return {
+      timestamp,
+      batterySoc: summary.batterySoc ?? null,
+      houseConsumption: summary.houseConsumption ?? null,
+      outsideTemp: this.getOutsideTemperature(context?.live?.temperature || []),
+      pvPower: summary.pvPower ?? null
+    };
+  }
+
+  normalizeActionPriority(priority) {
+    switch (String(priority || '').toLowerCase()) {
+      case 'high':
+        return 'high';
+      case 'medium':
+        return 'medium';
+      default:
+        return 'low';
+    }
+  }
+
+  normalizeGptAction(entry, actionContext, baseId, index) {
+    if (!entry || typeof entry !== 'object') {
+      return null;
+    }
+    const type = typeof entry.type === 'string' ? entry.type.trim() : '';
+    if (!type) {
+      return null;
+    }
+    const id = typeof entry.id === 'string' && entry.id.trim() ? entry.id : `${baseId}-${index}`;
+    const category = this.normalizeActionCategory(entry.category);
+    const priority = this.normalizeActionPriority(entry.priority);
+    const requiresApproval = typeof entry.requiresApproval === 'boolean' ? entry.requiresApproval : true;
+    const learningKey =
+      typeof entry.learningKey === 'string' && entry.learningKey.trim()
+        ? entry.learningKey
+        : `${category}_${type}`;
+    const value =
+      typeof entry.value === 'number' || typeof entry.value === 'boolean' ? entry.value : undefined;
+    const unit = typeof entry.unit === 'string' ? entry.unit : undefined;
+    return {
+      id,
+      category,
+      type,
+      target: entry.target,
+      value,
+      unit,
+      priority,
+      source: 'gpt',
+      reason: typeof entry.reason === 'string' ? entry.reason : 'GPT Vorschlag',
+      context: actionContext,
+      requiresApproval,
+      status: 'proposed',
+      learningKey,
+      title: typeof entry.title === 'string' ? entry.title : this.formatActionTitle(type),
+      description: typeof entry.description === 'string' ? entry.description : undefined
+    };
+  }
+
+  formatActionTitle(type) {
+    if (!type) {
+      return 'Aktion';
+    }
+    return String(type).replace(/_/g, ' ').replace(/\b\w/g, (char) => char.toUpperCase());
+  }
+
+  describeAction(action) {
+    return action.reason || action.description || action.type || 'Aktion';
+  }
+
   buildReportText(liveData, aggregates, recommendations, gptInsights, energySummary) {
     const lines = [];
     lines.push(`Trigger: ${new Date().toISOString()}`);
@@ -1631,6 +1828,7 @@ class AiAutopilot extends utils.Adapter {
     const baseId = Date.now();
     let index = 1;
     const actions = [];
+    const actionContext = this.buildActionContext(context);
 
     if (this.config.debug) {
       this.log.info(`[DEBUG] Deviations for action mapping: ${JSON.stringify(deviations, null, 2)}`);
@@ -1646,12 +1844,19 @@ class AiAutopilot extends utils.Adapter {
       const action = {
         id: `${baseId}-${index++}`,
         category: mapping.category,
+        type: mapping.type,
+        target: mapping.target,
+        value: mapping.value,
+        unit: mapping.unit,
+        priority: mapping.priority || this.mapDeviationPriority(deviation.severity),
+        source: 'history',
+        reason: mapping.reason,
+        context: actionContext,
+        requiresApproval: mapping.requiresApproval ?? true,
+        status: 'proposed',
+        learningKey: mapping.learningKey || 'deviation_generic',
         title: mapping.title,
         description: mapping.description,
-        reason: mapping.reason,
-        severity: this.mapDeviationSeverity(deviation.severity),
-        status: 'proposed',
-        source: 'deviation',
         deviationRef
       };
 
@@ -1671,27 +1876,33 @@ class AiAutopilot extends utils.Adapter {
     const actions = [];
     const baseId = Date.now();
     let index = 1;
-    const batterySoc = context?.summary?.batterySoc;
+    const batterySoc =
+      Number.isFinite(context?.summary?.batterySoc) ? context.summary.batterySoc : this.getLiveRoleValue(context?.live?.energy || [], 'batterySoc');
     const outsideTemp = this.getOutsideTemperature(context?.live?.temperature || []);
-    const gridPower = context?.summary?.gridPower;
-    const pvPower = context?.summary?.pvPower;
+    const gridPower =
+      Number.isFinite(context?.summary?.gridPower) ? context.summary.gridPower : this.sumLiveRole(context?.live?.energy || [], 'gridPower');
+    const pvPower =
+      Number.isFinite(context?.summary?.pvPower) ? context.summary.pvPower : this.sumLiveRole(context?.live?.energy || [], 'pvPower');
     const configuredThreshold = Number(this.config.energy?.gridPowerThreshold);
     const gridThreshold = Number.isFinite(configuredThreshold)
       ? configuredThreshold
       : DEFAULT_GRID_POWER_THRESHOLD;
+    const actionContext = this.buildActionContext(context);
 
     if (Number.isFinite(batterySoc) && batterySoc < 20) {
       actions.push({
         id: `${baseId}-${index++}`,
-        category: 'battery',
+        category: 'energy',
         type: 'protect_battery',
         priority: 'high',
         title: 'Batterie schützen',
         description: 'Batterie-SOC unter 20 %. Entladung reduzieren oder Reserve schützen.',
         reason: `Live-Regel: Batterie-SOC ${batterySoc}% < 20%.`,
-        severity: 'high',
+        context: actionContext,
+        requiresApproval: false,
         status: 'proposed',
-        source: 'live',
+        source: 'live-rule',
+        learningKey: 'battery_low',
         deviationRef: 'live:protect_battery'
       });
     }
@@ -1705,9 +1916,11 @@ class AiAutopilot extends utils.Adapter {
         title: 'Frostschutz prüfen',
         description: 'Außentemperatur unter 0 °C. Frostschutz und Heizkreise prüfen.',
         reason: `Live-Regel: Außentemperatur ${outsideTemp} °C < 0 °C.`,
-        severity: 'high',
+        context: actionContext,
+        requiresApproval: false,
         status: 'proposed',
-        source: 'live',
+        source: 'live-rule',
+        learningKey: 'frost_risk',
         deviationRef: 'live:check_frost_protection'
       });
     }
@@ -1726,9 +1939,11 @@ class AiAutopilot extends utils.Adapter {
         title: 'Last reduzieren',
         description: 'Hoher Netzbezug ohne PV-Erzeugung. Verbraucher prüfen und reduzieren.',
         reason: `Live-Regel: Netzbezug ${gridPower} W > ${gridThreshold} W bei PV 0.`,
-        severity: 'medium',
+        context: actionContext,
+        requiresApproval: true,
         status: 'proposed',
-        source: 'live',
+        source: 'live-rule',
+        learningKey: 'grid_peak',
         deviationRef: 'live:reduce_load'
       });
     }
@@ -1748,9 +1963,13 @@ class AiAutopilot extends utils.Adapter {
     if (category === 'energy' && type === 'night') {
       const action = {
         category: 'energy',
+        type: 'reduce_standby',
+        priority: 'medium',
         title: 'Standby-Verbrauch reduzieren',
         description: 'Erhöhter Nachtverbrauch erkannt. Standby-Verbraucher prüfen und reduzieren.',
-        reason: deviationDescription
+        reason: deviationDescription,
+        requiresApproval: true,
+        learningKey: 'energy_night'
       };
       this.logDebug('Deviation mapping rule fired: energy-night', { deviation, action });
       return action;
@@ -1759,9 +1978,13 @@ class AiAutopilot extends utils.Adapter {
     if (category === 'energy' && type === 'peak') {
       const action = {
         category: 'energy',
+        type: 'avoid_peak',
+        priority: 'high',
         title: 'Lastspitzen vermeiden',
         description: 'Hohe Lastspitze erkannt. Flexible Verbraucher zeitlich verschieben.',
-        reason: deviationDescription
+        reason: deviationDescription,
+        requiresApproval: true,
+        learningKey: 'energy_peak'
       };
       this.logDebug('Deviation mapping rule fired: energy-peak', { deviation, action });
       return action;
@@ -1769,10 +1992,14 @@ class AiAutopilot extends utils.Adapter {
 
     if (type === 'anomaly' && Number.isFinite(batterySoc) && batterySoc < 20) {
       const action = {
-        category: 'battery',
+        category: 'energy',
+        type: 'protect_battery',
+        priority: 'high',
         title: 'Batterie schützen',
         description: 'Batterie-SOC unter 20 %. Entladung reduzieren oder Reserve schützen.',
-        reason: deviationDescription
+        reason: deviationDescription,
+        requiresApproval: true,
+        learningKey: 'battery_low'
       };
       this.logDebug('Deviation mapping rule fired: battery-low-soc', { deviation, action });
       return action;
@@ -1781,9 +2008,13 @@ class AiAutopilot extends utils.Adapter {
     if (category === 'water' && type === 'night') {
       const action = {
         category: 'water',
+        type: 'check_leak',
+        priority: 'high',
         title: 'Mögliche Wasserleckage prüfen',
         description: 'Nächtlicher Wasserverbrauch über Baseline. Leitungen und Geräte prüfen.',
-        reason: deviationDescription
+        reason: deviationDescription,
+        requiresApproval: true,
+        learningKey: 'water_night'
       };
       this.logDebug('Deviation mapping rule fired: water-night', { deviation, action });
       return action;
@@ -1798,9 +2029,13 @@ class AiAutopilot extends utils.Adapter {
     ) {
       const action = {
         category: 'heating',
+        type: 'check_heating_control',
+        priority: 'medium',
         title: 'Heizungsregelung prüfen',
         description: 'Außentemperatur höher als Innentemperatur. Heizungsregelung prüfen.',
-        reason: deviationDescription
+        reason: deviationDescription,
+        requiresApproval: true,
+        learningKey: 'heating_inefficiency'
       };
       this.logDebug('Deviation mapping rule fired: heating-inefficiency', { deviation, action });
       return action;
@@ -1809,15 +2044,19 @@ class AiAutopilot extends utils.Adapter {
     const fallbackCategory = this.normalizeActionCategory(category);
     const action = {
       category: fallbackCategory,
+      type: 'inspect_deviation',
+      priority: this.mapDeviationPriority(deviation?.severity),
       title: 'Abweichung prüfen',
       description: 'Eine Abweichung wurde erkannt. Bitte Ursache prüfen.',
-      reason: deviationDescription
+      reason: deviationDescription,
+      requiresApproval: true,
+      learningKey: 'deviation_generic'
     };
     this.logDebug('Deviation mapping rule fired: fallback', { deviation, action });
     return action;
   }
 
-  mapDeviationSeverity(severity) {
+  mapDeviationPriority(severity) {
     switch (severity) {
       case 'critical':
         return 'high';
@@ -1825,16 +2064,20 @@ class AiAutopilot extends utils.Adapter {
         return 'medium';
       case 'info':
       default:
-        return 'info';
+        return 'low';
     }
   }
 
   normalizeActionCategory(category) {
-    const allowed = new Set(['energy', 'heating', 'water', 'pv', 'battery', 'comfort']);
-    if (allowed.has(category)) {
-      return category;
+    const normalized = String(category || '').toLowerCase();
+    const allowed = new Set(['energy', 'heating', 'water', 'pv', 'safety']);
+    if (allowed.has(normalized)) {
+      return normalized;
     }
-    return 'comfort';
+    if (normalized === 'battery') {
+      return 'energy';
+    }
+    return 'energy';
   }
 
   isDuplicateAction(action, existing) {
@@ -1842,7 +2085,8 @@ class AiAutopilot extends utils.Adapter {
       (entry) =>
         entry.id === action.id ||
         (entry.category === action.category &&
-          entry.title === action.title &&
+          entry.type === action.type &&
+          entry.learningKey === action.learningKey &&
           entry.deviationRef === action.deviationRef)
     );
   }
@@ -1854,7 +2098,8 @@ class AiAutopilot extends utils.Adapter {
         continue;
       }
       const key =
-        action.id || `${action.category || 'unknown'}:${action.title || 'action'}:${action.deviationRef || ''}`;
+        action.id ||
+        `${action.category || 'unknown'}:${action.type || 'action'}:${action.learningKey || ''}:${action.deviationRef || ''}`;
       if (uniqueMap.has(key)) {
         this.logDebug('Duplicate action replaced', action);
       }
@@ -1885,7 +2130,7 @@ class AiAutopilot extends utils.Adapter {
         }
       } catch (error) {
         action.executionResult = { status: 'error', message: error.message };
-        this.handleError(`Aktion fehlgeschlagen: ${action.description}`, error, true);
+        this.handleError(`Aktion fehlgeschlagen: ${this.describeAction(action)}`, error, true);
       } finally {
         action.status = 'executed';
       }
@@ -1896,6 +2141,9 @@ class AiAutopilot extends utils.Adapter {
       approvedActions.map((action) =>
         this.buildFeedbackEntry(action, 'approved', action.executionResult)
       )
+    );
+    await this.storeLearningEntries(
+      approvedActions.map((action) => this.buildLearningEntry(action, 'approved'))
     );
   }
 
@@ -1941,23 +2189,35 @@ class AiAutopilot extends utils.Adapter {
     return {
       energy: async (action) => this.handleEnergyAction(action),
       heating: async (action) => this.handleHeatingAction(action),
-      water: async (action) => this.handleWaterAction(action)
+      water: async (action) => this.handleWaterAction(action),
+      pv: async (action) => this.handlePvAction(action),
+      safety: async (action) => this.handleSafetyAction(action)
     };
   }
 
   async handleEnergyAction(action) {
-    this.log.info(`Energie-Aktion: ${action.description}`);
+    this.log.info(`Energie-Aktion: ${this.describeAction(action)}`);
     return { status: 'success', message: 'Energie-Aktion protokolliert' };
   }
 
   async handleHeatingAction(action) {
-    this.log.info(`Heizungs-Aktion: ${action.description}`);
+    this.log.info(`Heizungs-Aktion: ${this.describeAction(action)}`);
     return { status: 'success', message: 'Heizungs-Aktion protokolliert' };
   }
 
   async handleWaterAction(action) {
-    this.log.info(`Wasser-Aktion: ${action.description}`);
+    this.log.info(`Wasser-Aktion: ${this.describeAction(action)}`);
     return { status: 'success', message: 'Wasser-Aktion protokolliert' };
+  }
+
+  async handlePvAction(action) {
+    this.log.info(`PV-Aktion: ${this.describeAction(action)}`);
+    return { status: 'success', message: 'PV-Aktion protokolliert' };
+  }
+
+  async handleSafetyAction(action) {
+    this.log.info(`Sicherheits-Aktion: ${this.describeAction(action)}`);
+    return { status: 'success', message: 'Sicherheits-Aktion protokolliert' };
   }
 
   async sendTelegramMessage(text, options = {}) {
@@ -2037,6 +2297,11 @@ class AiAutopilot extends utils.Adapter {
       if (this.config.debug) {
         this.log.info(`[DEBUG] Telegram modify text received: ${text}`);
       }
+      if (this.pendingActions) {
+        await this.storeLearningEntries(
+          this.pendingActions.map((action) => this.buildLearningEntry(action, 'modified'))
+        );
+      }
       return;
     }
 
@@ -2063,6 +2328,9 @@ class AiAutopilot extends utils.Adapter {
             this.buildFeedbackEntry(action, 'approved', action.executionResult)
           )
         );
+        await this.storeLearningEntries(
+          this.pendingActions.map((action) => this.buildLearningEntry(action, 'approved'))
+        );
       } else {
         await this.executeActions(this.pendingActions);
       }
@@ -2081,22 +2349,27 @@ class AiAutopilot extends utils.Adapter {
           this.buildFeedbackEntry(action, 'rejected', action.executionResult)
         )
       );
+      await this.storeLearningEntries(
+        this.pendingActions.map((action) => this.buildLearningEntry(action, 'rejected'))
+      );
       this.log.info('Aktionen wurden abgelehnt.');
       this.pendingActions = null;
     }
   }
 
   formatActionLine(action) {
-    const severity = String(action.severity || 'info').toUpperCase();
+    const priority = this.normalizeActionPriority(action.priority);
+    const priorityLabel = priority.toUpperCase();
     const categoryEmoji = this.getCategoryEmoji(action.category);
-    const emoji = this.getSeverityEmoji(action.severity);
-    const title = action.title || 'Aktion';
-    const description = action.description ? ` (${action.description})` : '';
-    return `- ${categoryEmoji} ${emoji} *${title}*${description} _[${severity}]_`;
+    const emoji = this.getPriorityEmoji(priority);
+    const title = action.title || this.formatActionTitle(action.type);
+    const detail = action.reason || action.description;
+    const description = detail ? ` (${detail})` : '';
+    return `- ${categoryEmoji} ${emoji} *${title}*${description} _[${priorityLabel}]_`;
   }
 
-  getSeverityEmoji(severity) {
-    switch (String(severity || '').toLowerCase()) {
+  getPriorityEmoji(priority) {
+    switch (String(priority || '').toLowerCase()) {
       case 'high':
       case 'critical':
         return '🔥';
@@ -2118,10 +2391,8 @@ class AiAutopilot extends utils.Adapter {
         return '💧';
       case 'pv':
         return '☀️';
-      case 'battery':
-        return '🔋';
-      case 'comfort':
-        return '🛋️';
+      case 'safety':
+        return '🛡️';
       default:
         return '📌';
     }
@@ -2134,8 +2405,7 @@ class AiAutopilot extends utils.Adapter {
       heating: 'Heizung',
       water: 'Wasser',
       pv: 'PV',
-      battery: 'Batterie',
-      comfort: 'Komfort'
+      safety: 'Sicherheit'
     };
     const labels = Array.from(categories)
       .map((category) => labelMap[category] || category)
@@ -2390,6 +2660,13 @@ class AiAutopilot extends utils.Adapter {
     return values.reduce((sum, value) => sum + value, 0);
   }
 
+  getLiveRoleValue(entries, role) {
+    const entry = (entries || []).find(
+      (item) => item && item.role === role && Number.isFinite(Number(item.value))
+    );
+    return entry ? Number(entry.value) : null;
+  }
+
   getOutsideTemperature(entries) {
     const outsideEntry = (entries || []).find((entry) => entry && entry.role === 'outside');
     const value = outsideEntry?.temperature;
@@ -2490,6 +2767,27 @@ class AiAutopilot extends utils.Adapter {
     }
   }
 
+  async loadLearningHistory() {
+    try {
+      const existing = await this.getStateAsync('memory.learning');
+      if (!existing || !existing.val) {
+        this.learningHistory = [];
+        return;
+      }
+      const parsed = JSON.parse(String(existing.val));
+      if (Array.isArray(parsed)) {
+        this.learningHistory = parsed.slice(-200);
+      } else if (parsed && typeof parsed === 'object') {
+        this.learningHistory = [parsed].slice(-200);
+      } else {
+        this.learningHistory = [];
+      }
+    } catch (error) {
+      this.learningHistory = [];
+      this.handleError('Learning Historie konnte nicht geladen werden', error, true);
+    }
+  }
+
   buildFeedbackContext(context, energySummary) {
     const timeLabel = new Date(context.timestamp).toLocaleTimeString('de-DE', {
       hour: '2-digit',
@@ -2523,6 +2821,24 @@ class AiAutopilot extends utils.Adapter {
     };
   }
 
+  buildLearningEntry(action, userDecision) {
+    const context = action?.context || {};
+    const timestamp = context.timestamp || new Date().toISOString();
+    const timeOfDay = new Date(timestamp).toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' });
+    return {
+      learningKey: String(action.learningKey || 'unknown'),
+      actionType: String(action.type || 'unknown'),
+      userDecision,
+      context: {
+        timeOfDay,
+        batterySoc: context.batterySoc ?? null,
+        outsideTemp: context.outsideTemp ?? null,
+        pvPower: context.pvPower ?? null
+      },
+      timestamp: new Date().toISOString()
+    };
+  }
+
   async storeFeedbackEntries(entries) {
     if (!Array.isArray(entries) || entries.length === 0) {
       return;
@@ -2538,6 +2854,21 @@ class AiAutopilot extends utils.Adapter {
     }
   }
 
+  async storeLearningEntries(entries) {
+    if (!Array.isArray(entries) || entries.length === 0) {
+      return;
+    }
+    try {
+      this.learningHistory = [...this.learningHistory, ...entries].slice(-200);
+      await this.setStateAsync('memory.learning', JSON.stringify(this.learningHistory, null, 2), true);
+      if (this.config.debug) {
+        this.log.info(`[DEBUG] Learning entry stored (${entries.length} entries)`);
+      }
+    } catch (error) {
+      this.log.warn(`Learning konnte nicht gespeichert werden: ${error.message}`);
+    }
+  }
+
   wasActionExecuted(executionResult) {
     const status = executionResult?.status;
     return status === 'success' || status === 'error';
@@ -2545,7 +2876,7 @@ class AiAutopilot extends utils.Adapter {
 
   normalizeFeedbackCategory(category) {
     const normalized = String(category || '').toLowerCase();
-    const allowed = new Set(['energy', 'water', 'heating', 'pv', 'battery']);
+    const allowed = new Set(['energy', 'water', 'heating', 'pv', 'safety']);
     if (allowed.has(normalized)) {
       return normalized;
     }
