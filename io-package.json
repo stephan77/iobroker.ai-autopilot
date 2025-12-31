@@ -1,6 +1,12 @@
 {
+  "_id": "ai-autopilot",
   "common": {
     "name": "ai-autopilot",
+    "title": "AI Autopilot",
+    "desc": {
+      "en": "AI-based energy and automation autopilot",
+      "de": "KI-basierter Energie- und Automations-Autopilot"
+    },
     "main": "main.js",
     "version": "0.5.8",
     "mode": "daemon",
@@ -18,23 +24,17 @@
     "intervalMin": 60,
     "dryRun": true,
     "debug": false,
+
     "telegram": {
       "enabled": false,
       "instance": "telegram.0",
       "chatId": ""
     },
-    "dailyReportEnabled": false,
-    "dailyReportTime": "19:00",
-    "dailyReportDays": [
-      1,
-      2,
-      3,
-      4,
-      5
-    ],
+
     "dailyReport": {
       "enabled": false,
-      "time": "08:00",
+      "time": "19:00",
+      "days": [1,2,3,4,5],
       "timezone": "",
       "include": {
         "summary": true,
@@ -43,6 +43,7 @@
         "deviations": true
       }
     },
+
     "energy": {
       "houseConsumption": "",
       "gridPower": "",
@@ -52,37 +53,32 @@
       "wallbox": "",
       "additionalSources": []
     },
-    "energySources": [],
-    "pvSources": [],
-    "pvDailySources": [],
-    "consumers": [],
+
     "rooms": [],
     "heaters": [],
+    "windowContacts": [],
+
     "temperature": {
       "outside": "",
       "weather": "",
       "frostRisk": ""
     },
-    "windowContacts": [],
+
     "water": {
       "total": "",
       "daily": "",
       "hotWater": "",
       "coldWater": "",
-      "boilerTemp": "",
-      "circulation": "",
       "additionalSources": [],
       "flowSources": []
     },
-    "waterSources": [],
+
     "leakSensors": [],
+
     "history": {
       "influx": {
         "enabled": false,
         "instance": "influxdb.0",
-        "periodHours": 24,
-        "resolutionMin": 15,
-        "datapoints": [],
         "timeframeHours": 24,
         "resolutionMinutes": 15,
         "dataPoints": []
@@ -90,9 +86,6 @@
       "mysql": {
         "enabled": false,
         "instance": "mysql.0",
-        "periodDays": 7,
-        "resolutionMin": 60,
-        "datapoints": [],
         "timeframeDays": 7,
         "resolutionMinutes": 60,
         "dataPoints": []
