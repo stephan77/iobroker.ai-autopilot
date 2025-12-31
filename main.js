@@ -15,6 +15,7 @@ class AiAutopilot extends utils.Adapter {
     super({ ...options, name: 'ai-autopilot' });
     this.on('ready', () => this.onReady());
     this.on('stateChange', (id, state) => this.onStateChange(id, state));
+    this.on('message', (obj) => this.onMessage(obj));
     this.on('unload', (callback) => this.onUnload(callback));
 
     this.running = false;
@@ -23,6 +24,7 @@ class AiAutopilot extends utils.Adapter {
     this.openaiClient = null;
     this.feedbackHistory = [];
     this.lastContextSummary = null;
+    this.awaitingTelegramInput = false;
   }
 
   async onReady() {
@@ -215,6 +217,30 @@ class AiAutopilot extends utils.Adapter {
     }
   }
 
+  async onMessage(obj) {
+    if (!obj) {
+      return;
+    }
+
+    if (this.config.debug) {
+      this.log.info(`[DEBUG] Telegram message received: ${JSON.stringify(obj)}`);
+    }
+
+    const payload = obj.message || obj;
+    const callbackData =
+      payload.callback_data || payload.data || payload?.message?.data || payload?.message?.callback_data;
+    const text = payload.text || payload?.message?.text;
+
+    if (callbackData) {
+      await this.handleTelegramCallback(String(callbackData));
+      return;
+    }
+
+    if (typeof text === 'string' && text.trim().length > 0) {
+      await this.handleTelegramText(text.trim());
+    }
+  }
+
   async processFeedback(feedback) {
     if (!this.pendingActions) {
       return;
@@ -222,35 +248,9 @@ class AiAutopilot extends utils.Adapter {
 
     const normalized = feedback.toUpperCase();
     if (normalized === 'JA') {
-      this.updateActionStatuses(this.pendingActions, 'approved');
-      if (this.config.dryRun) {
-        this.log.info('Dry-Run aktiv: Aktionen werden nicht ausgeführt.');
-        for (const action of this.pendingActions) {
-          action.executionResult = { status: 'skipped', reason: 'dryRun' };
-        }
-        await this.setStateAsync('report.actions', JSON.stringify(this.pendingActions, null, 2), true);
-        await this.storeFeedbackEntries(
-          this.pendingActions.map((action) =>
-            this.buildFeedbackEntry(action, 'approved', action.executionResult)
-          )
-        );
-      } else {
-        await this.executeActions(this.pendingActions);
-      }
-      this.pendingActions = null;
+      await this.finalizeApproval('approved');
     } else if (normalized === 'NEIN') {
-      this.updateActionStatuses(this.pendingActions, 'rejected');
-      for (const action of this.pendingActions) {
-        action.executionResult = { status: 'skipped', reason: 'rejected' };
-      }
-      await this.setStateAsync('report.actions', JSON.stringify(this.pendingActions, null, 2), true);
-      await this.storeFeedbackEntries(
-        this.pendingActions.map((action) =>
-          this.buildFeedbackEntry(action, 'rejected', action.executionResult)
-        )
-      );
-      this.log.info('Aktionen wurden abgelehnt.');
-      this.pendingActions = null;
+      await this.finalizeApproval('rejected');
     } else if (normalized.startsWith('ÄNDERN')) {
       await this.setStateAsync('memory.feedback', JSON.stringify(this.feedbackHistory, null, 2), true);
       this.log.info(`Änderungswunsch: ${feedback}`);
@@ -332,7 +332,7 @@ class AiAutopilot extends utils.Adapter {
       await this.setStateAsync('report.last', reportText, true);
       await this.setStateAsync('report.actions', JSON.stringify(finalActions, null, 2), true);
 
-      if (finalActions.length > 0 && !this.config.dryRun) {
+      if (finalActions.length > 0 && !this.config.dryRun && this.config.telegram.enabled) {
         await this.requestApproval(finalActions, reportText);
       }
 
@@ -1399,10 +1399,7 @@ class AiAutopilot extends utils.Adapter {
   async requestApproval(actions, reportText) {
     this.pendingActions = actions;
     const approvalText = this.buildApprovalMessage(actions, reportText);
-    await this.sendTelegramMessage(
-      'Freigabe erforderlich: Antworten mit JA, NEIN oder ÄNDERN: <Text>',
-      approvalText
-    );
+    await this.sendTelegramMessage(approvalText, { includeKeyboard: true });
   }
 
   async executeActions(actions) {
@@ -1436,12 +1433,24 @@ class AiAutopilot extends utils.Adapter {
   }
 
   buildApprovalMessage(actions, reportText) {
-    const lines = ['Freigabe erforderlich. Bitte Antwort senden: JA, NEIN oder ÄNDERN:<Text>', ''];
-    lines.push('Aktionen:');
+    const analysisLabel = this.buildAnalysisLabel(actions);
+    const timeLabel = new Date().toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' });
+    const modeLabel = this.config.mode || 'auto';
+    const lines = [
+      '🤖🏠 AI-Autopilot – Entscheidung erforderlich',
+      '',
+      `⚡ Analyse: ${analysisLabel}`,
+      `🕒 ${timeLabel} | Modus: ${modeLabel}`,
+      '',
+      '🔎 Vorgeschlagene Maßnahmen:',
+      ''
+    ];
+
     for (const action of actions) {
-      lines.push(`- [${action.severity}] ${action.title}: ${action.description}`);
+      lines.push(this.formatActionLine(action));
     }
-    lines.push('', 'Report:', reportText);
+
+    lines.push('', 'Bitte auswählen:');
     return lines.join('\n');
   }
 
@@ -1474,20 +1483,168 @@ class AiAutopilot extends utils.Adapter {
     return { status: 'success', message: 'Wasser-Aktion protokolliert' };
   }
 
-  async sendTelegramMessage(subject, reportText) {
-    if (!this.config.telegram.enabled || !this.config.telegram.instance) {
+  async sendTelegramMessage(text, options = {}) {
+    if (this.config.dryRun) {
       return;
     }
 
-    const message = `${subject}\n\n${reportText}`;
+    if (!this.config.telegram.enabled || !this.config.telegram.instance) {
+      if (this.config.debug && this.config.telegram.enabled) {
+        this.log.info('[DEBUG] Telegram enabled but instance missing.');
+      }
+      return;
+    }
+
+    if (!this.config.telegram.chatId) {
+      this.log.warn('Telegram chatId fehlt. Nachricht wird ohne chatId gesendet.');
+    }
+
+    const { includeKeyboard = false } = options;
+
     try {
-      this.sendTo(this.config.telegram.instance, 'send', {
-        text: message,
+      if (this.config.debug) {
+        this.log.info(`[DEBUG] Telegram send: ${text}`);
+      }
+      const payload = {
+        text,
         chatId: this.config.telegram.chatId || undefined
-      });
+      };
+
+      if (includeKeyboard) {
+        payload.reply_markup = {
+          inline_keyboard: [
+            [{ text: '✅ Alle umsetzen', callback_data: 'approve_all' }],
+            [{ text: '❌ Alle ablehnen', callback_data: 'reject_all' }],
+            [{ text: '✏️ Anpassen', callback_data: 'modify' }]
+          ]
+        };
+      }
+
+      this.sendTo(this.config.telegram.instance, 'send', payload);
     } catch (error) {
       this.handleError('Telegram Versand fehlgeschlagen', error, true);
     }
+  }
+
+  async handleTelegramCallback(callbackData) {
+    if (this.config.debug) {
+      this.log.info(`[DEBUG] Telegram callback received: ${callbackData}`);
+    }
+
+    if (!this.pendingActions) {
+      this.log.warn('Telegram callback received but no pending actions are available.');
+      return;
+    }
+
+    if (callbackData === 'approve_all') {
+      await this.finalizeApproval('approved');
+      return;
+    }
+
+    if (callbackData === 'reject_all') {
+      await this.finalizeApproval('rejected');
+      return;
+    }
+
+    if (callbackData === 'modify') {
+      this.awaitingTelegramInput = true;
+      await this.sendTelegramMessage(
+        '✏️ Bitte sende deinen Änderungswunsch als Text. Ich speichere ihn unter memory.feedback.'
+      );
+    }
+  }
+
+  async handleTelegramText(text) {
+    if (this.awaitingTelegramInput) {
+      this.awaitingTelegramInput = false;
+      await this.setStateAsync('memory.feedback', text, false);
+      if (this.config.debug) {
+        this.log.info(`[DEBUG] Telegram modify text stored: ${text}`);
+      }
+      return;
+    }
+
+    if (this.pendingActions) {
+      await this.processFeedback(text);
+    }
+  }
+
+  async finalizeApproval(decision) {
+    if (!this.pendingActions) {
+      return;
+    }
+
+    if (decision === 'approved') {
+      this.updateActionStatuses(this.pendingActions, 'approved');
+      if (this.config.dryRun) {
+        this.log.info('Dry-Run aktiv: Aktionen werden nicht ausgeführt.');
+        for (const action of this.pendingActions) {
+          action.executionResult = { status: 'skipped', reason: 'dryRun' };
+        }
+        await this.setStateAsync('report.actions', JSON.stringify(this.pendingActions, null, 2), true);
+        await this.storeFeedbackEntries(
+          this.pendingActions.map((action) =>
+            this.buildFeedbackEntry(action, 'approved', action.executionResult)
+          )
+        );
+      } else {
+        await this.executeActions(this.pendingActions);
+      }
+      this.pendingActions = null;
+      return;
+    }
+
+    if (decision === 'rejected') {
+      this.updateActionStatuses(this.pendingActions, 'rejected');
+      for (const action of this.pendingActions) {
+        action.executionResult = { status: 'skipped', reason: 'rejected' };
+      }
+      await this.setStateAsync('report.actions', JSON.stringify(this.pendingActions, null, 2), true);
+      await this.storeFeedbackEntries(
+        this.pendingActions.map((action) =>
+          this.buildFeedbackEntry(action, 'rejected', action.executionResult)
+        )
+      );
+      this.log.info('Aktionen wurden abgelehnt.');
+      this.pendingActions = null;
+    }
+  }
+
+  formatActionLine(action) {
+    const severity = String(action.severity || 'info').toUpperCase();
+    const emoji = this.getSeverityEmoji(action.severity);
+    const title = action.title || 'Aktion';
+    const description = action.description ? ` (${action.description})` : '';
+    return `- ${emoji} [${severity}] ${title}${description}`;
+  }
+
+  getSeverityEmoji(severity) {
+    switch (String(severity || '').toLowerCase()) {
+      case 'high':
+      case 'critical':
+        return '🔥';
+      case 'medium':
+      case 'warn':
+        return '⚠️';
+      default:
+        return 'ℹ️';
+    }
+  }
+
+  buildAnalysisLabel(actions) {
+    const categories = new Set((actions || []).map((action) => action.category).filter(Boolean));
+    const labelMap = {
+      energy: 'Energie',
+      heating: 'Heizung',
+      water: 'Wasser',
+      pv: 'PV',
+      battery: 'Batterie',
+      comfort: 'Komfort'
+    };
+    const labels = Array.from(categories)
+      .map((category) => labelMap[category] || category)
+      .filter(Boolean);
+    return labels.length > 0 ? labels.join(' & ') : 'System';
   }
 
   async readNumber(id) {
