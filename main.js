@@ -92,7 +92,7 @@ class AiAutopilot extends utils.Adapter {
         this.intervalTimer = null;
       }
       if (this.dailyReportTimer) {
-        clearTimeout(this.dailyReportTimer);
+        clearInterval(this.dailyReportTimer);
         this.dailyReportTimer = null;
       }
       callback();
@@ -180,6 +180,18 @@ class AiAutopilot extends utils.Adapter {
       common: {
         type: 'string',
         role: 'text',
+        read: true,
+        write: false,
+        def: ''
+      },
+      native: {}
+    });
+
+    await this.setObjectNotExistsAsync('meta.lastDailyReportTs', {
+      type: 'state',
+      common: {
+        type: 'string',
+        role: 'value.time',
         read: true,
         write: false,
         def: ''
