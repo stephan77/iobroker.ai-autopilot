@@ -287,12 +287,21 @@ class AiAutopilot extends utils.Adapter {
         await this.setStateAsync('info.lastError', '', true);
         return;
       }
-      const energySummary = this.buildEnergySummary(
-        context.live.energy,
-        liveData.pvSources,
-        liveData.pvDailySources,
-        context.live.water
-      );
+      if (this.config.debug) {
+        this.log.info(`[DEBUG] Live energy context: ${JSON.stringify(context.live.energy, null, 2)}`);
+      }
+      const energySummary = this.buildEnergySummary(context.live.energy);
+      if (this.config.debug) {
+        this.log.info(`[DEBUG] Energy summary: ${JSON.stringify(energySummary, null, 2)}`);
+      }
+      const missingEnergyValues = this.getMissingEnergyValues(context.live.energy, energySummary);
+      if (missingEnergyValues.length > 0) {
+        const message = `Energy summary missing values for roles: ${missingEnergyValues.join(', ')}`;
+        await this.setStateAsync('report.last', message, true);
+        await this.setStateAsync('report.actions', JSON.stringify([], null, 2), true);
+        await this.setStateAsync('info.lastError', '', true);
+        return;
+      }
       context.summary = energySummary;
       this.lastContextSummary = this.buildFeedbackContext(context, energySummary);
       const recommendations = this.generateRecommendations(liveData, aggregates, energySummary);
@@ -378,6 +387,47 @@ class AiAutopilot extends utils.Adapter {
       },
       semantics: {}
     };
+
+    const singleEnergyMappings = [
+      {
+        id: this.config.energy?.houseConsumption,
+        role: 'houseConsumption',
+        description: 'House consumption'
+      },
+      {
+        id: this.config.energy?.gridPower,
+        role: 'gridPower',
+        description: 'Grid power'
+      },
+      {
+        id: this.config.energy?.batterySoc,
+        role: 'batterySoc',
+        description: 'Battery SOC'
+      },
+      {
+        id: this.config.energy?.batteryPower,
+        role: 'batteryPower',
+        description: 'Battery power'
+      },
+      {
+        id: this.config.energy?.wallbox,
+        role: 'wallbox',
+        description: 'Wallbox'
+      }
+    ];
+
+    for (const entry of singleEnergyMappings) {
+      if (!entry.id) {
+        continue;
+      }
+      const value = await this.getForeignStateValue(entry.id);
+      context.live.energy.push({
+        value: value ?? null,
+        unit: '',
+        role: entry.role,
+        description: entry.description
+      });
+    }
 
     for (const src of this.config.energySources || []) {
       if (!src || !src.enabled) {
@@ -1061,7 +1111,7 @@ class AiAutopilot extends utils.Adapter {
     };
   }
 
-  buildEnergySummary(energyEntries, pvSources, pvDailySources, waterEntries) {
+  buildEnergySummary(energyEntries) {
     const sumValues = (entries) => {
       const values = (entries || [])
         .map((entry) => Number(entry.value))
@@ -1075,6 +1125,9 @@ class AiAutopilot extends utils.Adapter {
     const sumRole = (role) =>
       sumValues((energyEntries || []).filter((entry) => entry && entry.role === role));
 
+    const sumRoles = (roles) =>
+      sumValues((energyEntries || []).filter((entry) => entry && roles.includes(entry.role)));
+
     const firstRole = (role) => {
       const entry = (energyEntries || []).find(
         (item) => item && item.role === role && Number.isFinite(Number(item.value))
@@ -1082,20 +1135,48 @@ class AiAutopilot extends utils.Adapter {
       return entry ? Number(entry.value) : null;
     };
 
-    const sumWaterRoles = (roles) =>
-      sumValues((waterEntries || []).filter((entry) => entry && roles.includes(entry.role)));
-
     return {
       ...this.buildEmptySummary(),
       houseConsumption: sumRole('houseConsumption'),
       gridPower: sumRole('gridPower'),
       batterySoc: firstRole('batterySoc'),
       batteryPower: sumRole('batteryPower'),
-      pvPower: sumValues(pvSources),
-      pvDailyEnergy: sumValues(pvDailySources),
-      waterConsumption: sumWaterRoles(['waterTotal', 'waterFlow']),
+      pvPower: sumRole('pvPower'),
+      pvDailyEnergy: sumRole('pvDailyEnergy'),
+      waterConsumption: sumRoles(['waterTotal', 'waterFlow', 'waterConsumption']),
       wallboxPower: sumRole('wallbox')
     };
+  }
+
+  getMissingEnergyValues(energyEntries, energySummary) {
+    const roleToSummaryField = {
+      houseConsumption: 'houseConsumption',
+      gridPower: 'gridPower',
+      batterySoc: 'batterySoc',
+      batteryPower: 'batteryPower',
+      pvPower: 'pvPower',
+      pvDailyEnergy: 'pvDailyEnergy',
+      waterTotal: 'waterConsumption',
+      waterFlow: 'waterConsumption',
+      waterConsumption: 'waterConsumption',
+      wallbox: 'wallboxPower'
+    };
+
+    const roles = new Set(
+      (energyEntries || [])
+        .map((entry) => entry?.role)
+        .filter((role) => role && Object.prototype.hasOwnProperty.call(roleToSummaryField, role))
+    );
+
+    const missing = [];
+    for (const role of roles) {
+      const field = roleToSummaryField[role];
+      if (!Number.isFinite(Number(energySummary[field]))) {
+        missing.push(role);
+      }
+    }
+
+    return missing;
   }
 
   logDebug(message, payload) {
