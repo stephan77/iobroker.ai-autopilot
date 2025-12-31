@@ -27,6 +27,13 @@ const DEFAULT_GRID_POWER_THRESHOLD = 500;
 class AiAutopilot extends utils.Adapter {
   constructor(options = {}) {
     super({ ...options, name: 'ai-autopilot' });
+    process.on('uncaughtException', err => {
+      this.log.error('[FATAL] Uncaught Exception: ' + err.stack);
+    });
+
+    process.on('unhandledRejection', err => {
+      this.log.error('[FATAL] Unhandled Rejection: ' + err);
+    });
     this.on('ready', () => this.onReady());
     this.on('stateChange', (id, state) => this.onStateChange(id, state));
     this.on('message', (obj) => this.onMessage(obj));
@@ -56,13 +63,7 @@ class AiAutopilot extends utils.Adapter {
       SUBSTITUTE_INITIAL_VALUE
     };
   }
-process.on('uncaughtException', err => {
-  this.log.error('[FATAL] Uncaught Exception: ' + err.stack);
-});
 
-process.on('unhandledRejection', err => {
-  this.log.error('[FATAL] Unhandled Rejection: ' + err);
-});
   async onReady() {
     try {
       await this.ensureStates();
