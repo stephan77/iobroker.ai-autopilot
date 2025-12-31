@@ -29,6 +29,7 @@ class AiAutopilot extends utils.Adapter {
     this.learningHistoryEntries = [];
     this.learningStats = {};
     this.lastContextSummary = null;
+    this.lastHistoryDeviations = [];
     this.awaitingTelegramInput = false;
     this.pendingModifyActionId = null;
   }
@@ -71,7 +72,7 @@ class AiAutopilot extends utils.Adapter {
         this.intervalTimer = null;
       }
       if (this.dailyReportTimer) {
-        clearInterval(this.dailyReportTimer);
+        clearTimeout(this.dailyReportTimer);
         this.dailyReportTimer = null;
       }
       callback();
@@ -131,6 +132,18 @@ class AiAutopilot extends utils.Adapter {
     });
 
     await this.setObjectNotExistsAsync('report.actions', {
+      type: 'state',
+      common: {
+        type: 'string',
+        role: 'json',
+        read: true,
+        write: false,
+        def: ''
+      },
+      native: {}
+    });
+
+    await this.setObjectNotExistsAsync('report.actionHistory', {
       type: 'state',
       common: {
         type: 'string',
@@ -232,115 +245,247 @@ class AiAutopilot extends utils.Adapter {
 
   startDailyReportScheduler() {
     if (this.dailyReportTimer) {
-      clearInterval(this.dailyReportTimer);
+      clearTimeout(this.dailyReportTimer);
       this.dailyReportTimer = null;
     }
 
-    this.dailyReportTimer = setInterval(() => {
-      this.runDailyReportIfDue().catch((error) => {
-        this.handleError('Daily report failed', error, true);
-      });
-    }, MINUTE_MS);
+    const dailyReportConfig = this.getDailyReportConfig();
+    if (!dailyReportConfig.enabled) {
+      this.logDebug('Daily report scheduler skipped (disabled)');
+      return;
+    }
 
-    this.runDailyReportIfDue().catch((error) => {
-      this.handleError('Daily report failed', error, true);
+    this.logDebug('Daily report scheduler initialized');
+    this.scheduleNextDailyReport(dailyReportConfig);
+  }
+
+  scheduleNextDailyReport(dailyReportConfig) {
+    const schedule = this.getNextDailyReportSchedule(dailyReportConfig);
+    if (!schedule) {
+      return;
+    }
+    const delay = Math.max(schedule.nextRun - Date.now(), 1000);
+    this.logDebug('Daily report next run calculated', {
+      nextRun: schedule.nextRun.toISOString(),
+      timeZone: schedule.timeZone || 'system'
     });
+
+    this.dailyReportTimer = setTimeout(() => {
+      this.runDailyReportIfDue()
+        .catch((error) => {
+          this.handleError('Daily report failed', error, true);
+        })
+        .finally(() => {
+          const refreshed = this.getDailyReportConfig();
+          if (refreshed.enabled) {
+            this.scheduleNextDailyReport(refreshed);
+          }
+        });
+    }, delay);
   }
 
   async runDailyReportIfDue() {
+    const dailyReportConfig = this.getDailyReportConfig();
+    if (!dailyReportConfig.enabled) {
+      this.logDebug('Daily report skipped (disabled)');
+      return;
+    }
+
     if (!this.config.telegram?.enabled) {
+      this.logDebug('Daily report skipped (Telegram disabled)');
       return;
     }
 
     const now = new Date();
-    const schedule = this.getDailyReportSchedule();
-    if (now.getHours() < schedule.hour || (now.getHours() === schedule.hour && now.getMinutes() < schedule.minute)) {
-      return;
-    }
-
-    const todayStamp = this.formatLocalDateStamp(now);
+    const todayStamp = this.formatDateStamp(now, dailyReportConfig.timezone);
     const lastSent = await this.readState('report.dailyLastSent');
     if (lastSent === todayStamp) {
+      this.logDebug('Daily report skipped (already sent)', { date: todayStamp });
       return;
     }
 
-    const report = await this.buildDailyReport();
+    const report = await this.buildDailyReport(dailyReportConfig, now);
     if (!report) {
+      this.logDebug('Daily report skipped (empty report)');
       return;
-    }
-
-    if (this.config.debug) {
-      this.log.info(`[DEBUG] Sending daily Telegram report for ${todayStamp}`);
     }
 
     try {
       await this.sendTelegramMessage(report, { parseMode: 'Markdown' });
       await this.setStateAsync('report.dailyLastSent', todayStamp, true);
+      this.logDebug('Daily report sent', { date: todayStamp });
     } catch (error) {
       this.handleError('Daily report send failed', error, true);
     }
   }
 
-  getDailyReportSchedule() {
-    return { hour: 7, minute: 0 };
+  getDailyReportConfig() {
+    const include = this.config.dailyReport?.include || {};
+    return {
+      enabled: Boolean(this.config.dailyReport?.enabled),
+      time: this.config.dailyReport?.time || '08:00',
+      timezone: this.normalizeTimeZone(this.config.dailyReport?.timezone),
+      include: {
+        summary: include.summary !== false,
+        actions: include.actions !== false,
+        learning: include.learning !== false,
+        deviations: include.deviations !== false
+      }
+    };
   }
 
-  formatLocalDateStamp(date) {
-    const year = date.getFullYear();
-    const month = String(date.getMonth() + 1).padStart(2, '0');
-    const day = String(date.getDate()).padStart(2, '0');
-    return `${year}-${month}-${day}`;
+  normalizeTimeZone(timeZone) {
+    const trimmed = String(timeZone || '').trim();
+    if (!trimmed) {
+      return null;
+    }
+    try {
+      new Intl.DateTimeFormat('en-US', { timeZone: trimmed }).format(new Date());
+      return trimmed;
+    } catch (error) {
+      this.log.warn(`Ungültige Zeitzone konfiguriert: ${trimmed}. System-Zeitzone wird verwendet.`);
+      return null;
+    }
   }
 
-  async buildDailyReport() {
-    const liveData = await this.collectLiveData();
-    const historyData = await this.collectHistoryData();
-    const houseSeries = this.findHistorySeries(historyData, this.config.energy?.houseConsumption, ['consumption']);
-    const gridSeries = this.findHistorySeries(historyData, this.config.energy?.gridPower, ['grid']);
-    const batterySeries = this.findHistorySeries(historyData, this.config.energy?.batterySoc, ['battery', 'soc']);
-    const waterSeries = this.findHistorySeries(historyData, this.getWaterBaselineId(), ['water']);
-    const outsideSeries = this.findHistorySeries(historyData, this.config.temperature?.outside, ['outside', 'temp']);
+  getDailyReportScheduleParts(config) {
+    const time = String(config?.time || '08:00');
+    const match = time.match(/^(\d{1,2}):(\d{2})$/);
+    if (!match) {
+      return { hour: 8, minute: 0 };
+    }
+    const hour = Number(match[1]);
+    const minute = Number(match[2]);
+    if (!Number.isInteger(hour) || !Number.isInteger(minute) || hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+      return { hour: 8, minute: 0 };
+    }
+    return { hour, minute };
+  }
 
-    const houseStats = this.computeSeriesStats(houseSeries?.values);
-    const batteryStats = this.computeSeriesStats(batterySeries?.values);
-    const waterStats = this.computeSeriesStats(waterSeries?.values);
-    const outsideStats = this.computeSeriesStats(outsideSeries?.values);
-    const insideAvgTemp = this.averageNumbers(
-      (liveData.rooms || [])
-        .map((room) => room.temperature)
-        .filter((temp) => Number.isFinite(temp))
+  getNextDailyReportSchedule(config) {
+    if (!config?.enabled) {
+      return null;
+    }
+    const { hour, minute } = this.getDailyReportScheduleParts(config);
+    const now = new Date();
+    const timeZone = config.timezone || null;
+    let target;
+
+    if (timeZone) {
+      const nowParts = this.getDatePartsInTimeZone(now, timeZone);
+      target = this.buildDateInTimeZone(
+        {
+          year: nowParts.year,
+          month: nowParts.month,
+          day: nowParts.day,
+          hour,
+          minute,
+          second: 0
+        },
+        timeZone
+      );
+      if (target <= now) {
+        const tomorrowParts = this.getDatePartsInTimeZone(new Date(now.getTime() + DAY_MS), timeZone);
+        target = this.buildDateInTimeZone(
+          {
+            year: tomorrowParts.year,
+            month: tomorrowParts.month,
+            day: tomorrowParts.day,
+            hour,
+            minute,
+            second: 0
+          },
+          timeZone
+        );
+      }
+    } else {
+      target = new Date(now);
+      target.setHours(hour, minute, 0, 0);
+      if (target <= now) {
+        target.setDate(target.getDate() + 1);
+      }
+    }
+
+    return { nextRun: target, timeZone };
+  }
+
+  getDatePartsInTimeZone(date, timeZone) {
+    const formatter = new Intl.DateTimeFormat('en-US', {
+      timeZone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false
+    });
+    const parts = formatter.formatToParts(date);
+    const values = {};
+    for (const part of parts) {
+      if (part.type !== 'literal') {
+        values[part.type] = part.value;
+      }
+    }
+    return {
+      year: Number(values.year),
+      month: Number(values.month),
+      day: Number(values.day),
+      hour: Number(values.hour),
+      minute: Number(values.minute),
+      second: Number(values.second)
+    };
+  }
+
+  getTimeZoneOffset(date, timeZone) {
+    const parts = this.getDatePartsInTimeZone(date, timeZone);
+    const utcTime = Date.UTC(
+      parts.year,
+      parts.month - 1,
+      parts.day,
+      parts.hour,
+      parts.minute,
+      parts.second
     );
+    return utcTime - date.getTime();
+  }
 
-    const pvEnergyTotal = await this.sumDailyPvEnergy(liveData);
-    const gridImportKwh = this.calculateGridImportKwh(gridSeries?.values);
-    const waterTotal = this.resolveWaterTotal(liveData, waterStats);
-    const waterBreakdown = this.resolveWaterBreakdown(liveData);
-    const nightWaterWarning = this.isNightWaterUsageWarning(waterSeries?.values);
-    const frostDetected = this.isFrostDetected(outsideSeries?.values, liveData.temperature?.frostRisk);
-    const actionSummary = await this.loadActionSummary();
+  buildDateInTimeZone(parts, timeZone) {
+    const utcGuess = new Date(Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, parts.second));
+    const offset = this.getTimeZoneOffset(utcGuess, timeZone);
+    return new Date(utcGuess.getTime() - offset);
+  }
+
+  formatDateStamp(date, timeZone) {
+    const parts = timeZone ? this.getDatePartsInTimeZone(date, timeZone) : {
+      year: date.getFullYear(),
+      month: date.getMonth() + 1,
+      day: date.getDate()
+    };
+    const month = String(parts.month).padStart(2, '0');
+    const day = String(parts.day).padStart(2, '0');
+    return `${parts.year}-${month}-${day}`;
+  }
+
+  async buildDailyReport(config, now = new Date()) {
+    await this.loadLearningHistoryEntries();
+    const actionHistory = await this.loadActionHistory();
+    const timeZone = config.timezone || null;
+    const rangeStart = new Date(now.getTime() - DAY_MS);
+    const summary = this.lastContextSummary || this.buildEmptySummary();
+    const deviations = Array.isArray(this.lastHistoryDeviations) ? this.lastHistoryDeviations : [];
+    const recentActions = this.filterActionsByWindow(actionHistory, rangeStart);
+    const recentLearning = this.filterLearningByWindow(this.learningHistoryEntries, rangeStart);
 
     return this.buildDailyReportText({
-      date: new Date(),
-      energy: {
-        avgConsumption: houseStats.avg,
-        peakConsumption: houseStats.max,
-        pvEnergyTotal: pvEnergyTotal,
-        gridImportKwh: gridImportKwh,
-        batteryMin: batteryStats.min,
-        batteryMax: batteryStats.max
-      },
-      water: {
-        total: waterTotal,
-        hot: waterBreakdown.hot,
-        cold: waterBreakdown.cold,
-        nightWarning: nightWaterWarning
-      },
-      climate: {
-        insideAvg: insideAvgTemp,
-        outsideAvg: outsideStats.avg,
-        frostDetected: frostDetected
-      },
-      actions: actionSummary
+      timeZone,
+      now,
+      rangeStart,
+      include: config.include,
+      summary,
+      deviations,
+      actions: this.summarizeActions(recentActions),
+      learning: this.summarizeLearning(recentLearning)
     });
   }
 
@@ -490,85 +635,174 @@ class AiAutopilot extends utils.Adapter {
     return Number.isFinite(stats.min) && stats.min <= 0;
   }
 
-  async loadActionSummary() {
-    const state = await this.getStateAsync('report.actions');
+  async loadActionHistory() {
+    const state = await this.getStateAsync('report.actionHistory');
     if (!state || !state.val) {
-      return { proposed: 0, approved: 0, rejected: 0, executed: 0 };
+      return [];
     }
     try {
       const actions = JSON.parse(state.val);
-      if (!Array.isArray(actions)) {
-        return { proposed: 0, approved: 0, rejected: 0, executed: 0 };
-      }
-      const summary = { proposed: 0, approved: 0, rejected: 0, executed: 0 };
-      for (const action of actions) {
-        const status = String(action?.status || 'proposed').toLowerCase();
-        summary.proposed += 1;
-        if (status === 'approved') {
-          summary.approved += 1;
-        }
-        if (status === 'rejected') {
-          summary.rejected += 1;
-        }
-        if (status === 'executed') {
-          summary.executed += 1;
-        }
-      }
-      return summary;
+      return Array.isArray(actions) ? actions : [];
     } catch (error) {
-      this.handleError('Daily report actions parsing failed', error, true);
-      return { proposed: 0, approved: 0, rejected: 0, executed: 0 };
+      this.handleError('Daily report action history parsing failed', error, true);
+      return [];
     }
+  }
+
+  filterActionsByWindow(actions, sinceDate) {
+    const since = sinceDate.getTime();
+    return (actions || []).filter((action) => {
+      const timestamp = this.getActionTimestamp(action);
+      return Number.isFinite(timestamp) && timestamp >= since;
+    });
+  }
+
+  filterLearningByWindow(entries, sinceDate) {
+    const since = sinceDate.getTime();
+    return (entries || []).filter((entry) => {
+      const timestamp = Date.parse(entry?.timestamp);
+      return Number.isFinite(timestamp) && timestamp >= since;
+    });
+  }
+
+  getActionTimestamp(action) {
+    if (!action) {
+      return null;
+    }
+    const timestamps = action.timestamps || {};
+    const candidates = [timestamps.executedAt, timestamps.decidedAt, timestamps.createdAt, action.updatedAt];
+    for (const value of candidates) {
+      const parsed = Date.parse(value);
+      if (Number.isFinite(parsed)) {
+        return parsed;
+      }
+    }
+    return null;
+  }
+
+  summarizeActions(actions) {
+    const summary = { proposed: 0, approved: 0, rejected: 0, executed: 0 };
+    for (const action of actions || []) {
+      const status = String(action?.status || 'proposed').toLowerCase();
+      summary.proposed += 1;
+      if (status === 'approved') {
+        summary.approved += 1;
+      }
+      if (status === 'rejected') {
+        summary.rejected += 1;
+      }
+      if (status === 'executed') {
+        summary.executed += 1;
+      }
+    }
+    return summary;
+  }
+
+  summarizeLearning(entries) {
+    const summary = { approved: 0, rejected: 0, executed: 0, modified: 0, total: 0 };
+    for (const entry of entries || []) {
+      const decision = String(entry?.decision || entry?.userDecision || '').toLowerCase();
+      if (!decision) {
+        continue;
+      }
+      summary.total += 1;
+      if (decision === 'approved') {
+        summary.approved += 1;
+      } else if (decision === 'rejected') {
+        summary.rejected += 1;
+      } else if (decision === 'executed') {
+        summary.executed += 1;
+      } else if (decision === 'modified') {
+        summary.modified += 1;
+      }
+    }
+    return summary;
   }
 
   buildDailyReportText(data) {
     if (!data) {
       return '';
     }
-    const dateLabel = data.date.toLocaleDateString('de-DE');
+    const timeZone = data.timeZone || undefined;
+    const dateLabel = data.now.toLocaleDateString('de-DE', timeZone ? { timeZone } : undefined);
+    const timeLabel = data.now.toLocaleTimeString('de-DE', {
+      hour: '2-digit',
+      minute: '2-digit',
+      ...(timeZone ? { timeZone } : {})
+    });
+    const rangeStartLabel = data.rangeStart.toLocaleString('de-DE', {
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      ...(timeZone ? { timeZone } : {})
+    });
+    const rangeEndLabel = data.now.toLocaleString('de-DE', {
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      ...(timeZone ? { timeZone } : {})
+    });
+
     const lines = [
-      '📊🏠 *Tagesbericht – AI Autopilot*',
-      `🗓️ ${dateLabel}`,
-      '',
-      '⚡ *Energie*',
-      `- Ø Verbrauch: ${this.formatWatts(data.energy.avgConsumption)}`,
-      `- Spitze: ${this.formatWatts(data.energy.peakConsumption)}`,
-      `- PV: ${this.formatKwh(data.energy.pvEnergyTotal)}`,
-      `- Netz: ${this.formatKwh(data.energy.gridImportKwh)}`,
-      `- Batterie: ${this.formatSocRange(data.energy.batteryMin, data.energy.batteryMax)}`,
-      '',
-      '💧 *Wasser*',
-      `- Gesamt: ${this.formatLiters(data.water.total)}`
+      '📊 *Daily Summary*',
+      `🗓️ ${dateLabel} · ${timeLabel}`
     ];
 
-    if (Number.isFinite(data.water.hot)) {
-      lines.push(`- Warmwasser: ${this.formatLiters(data.water.hot)}`);
+    if (data.include.summary) {
+      lines.push(
+        '',
+        '⚡ *Energy overview*',
+        `- Hausverbrauch: ${this.formatWatts(data.summary.houseConsumption)}`,
+        `- PV-Leistung: ${this.formatWatts(data.summary.pvPower)}`,
+        `- Batterie SOC: ${this.formatSocRange(data.summary.batterySoc, data.summary.batterySoc)}`,
+        `- Netzbezug: ${this.formatWatts(data.summary.gridPower)}`
+      );
     }
-    if (Number.isFinite(data.water.cold)) {
-      lines.push(`- Kaltwasser: ${this.formatLiters(data.water.cold)}`);
+
+    if (data.include.deviations) {
+      const deviations = data.deviations || [];
+      lines.push('', '⚠️ *Deviations*');
+      if (deviations.length === 0) {
+        lines.push('- Keine relevanten Abweichungen erkannt');
+      } else {
+        for (const deviation of deviations.slice(0, 5)) {
+          lines.push(
+            `- ${deviation.label || deviation.type || 'Abweichung'} (${deviation.description || 'Details verfügbar'})`
+          );
+        }
+      }
     }
-    if (data.water.nightWarning) {
-      lines.push('- ⚠️ Nachtverbrauch erhöht');
+
+    if (data.include.learning) {
+      lines.push(
+        '',
+        '🧠 *Learning feedback*',
+        `- Genehmigt: ${data.learning.approved}`,
+        `- Abgelehnt: ${data.learning.rejected}`,
+        `- Umgesetzt: ${data.learning.executed}`,
+        `- Geändert: ${data.learning.modified}`
+      );
+    }
+
+    if (data.include.actions) {
+      lines.push(
+        '',
+        '✅ *Actions taken / ❌ rejected*',
+        `- Vorgeschlagen: ${data.actions.proposed}`,
+        `- Freigegeben: ${data.actions.approved}`,
+        `- Abgelehnt: ${data.actions.rejected}`,
+        `- Umgesetzt: ${data.actions.executed}`
+      );
     }
 
     lines.push(
       '',
-      '🌡️ *Klima*',
-      `- Innen: ${this.formatTemperature(data.climate.insideAvg)}`,
-      `- Außen: ${this.formatTemperature(data.climate.outsideAvg)}`
-    );
-
-    if (data.climate.frostDetected) {
-      lines.push('- ❄️ Frost erkannt');
-    }
-
-    lines.push(
-      '',
-      '🤖 *Aktionen*',
-      `- Vorgeschlagen: ${data.actions.proposed}`,
-      `- Freigegeben: ${data.actions.approved}`,
-      `- Abgelehnt: ${data.actions.rejected}`,
-      `- Umgesetzt: ${data.actions.executed}`
+      '🕒 *Time range covered*',
+      `${rangeStartLabel} → ${rangeEndLabel}`
     );
 
     return lines.join('\n');
@@ -678,6 +912,7 @@ class AiAutopilot extends utils.Adapter {
       const historyData = await this.collectHistoryData();
       const aggregates = this.aggregateData(historyData);
       const context = await this.buildContext(liveData, aggregates);
+      this.lastHistoryDeviations = Array.isArray(context.history?.deviations) ? context.history.deviations : [];
       if (this.config.debug) {
         this.log.info(
           `[DEBUG] History points loaded: ${JSON.stringify({
@@ -2589,9 +2824,40 @@ class AiAutopilot extends utils.Adapter {
     try {
       const normalized = (actions || []).map((action) => this.normalizeActionForPersistence(action));
       await this.setStateAsync('report.actions', JSON.stringify(normalized, null, 2), true);
+      await this.updateActionHistory(normalized);
       this.logDebug(debugLabel || 'Actions persisted', { count: normalized.length });
     } catch (error) {
       this.handleError('Aktionen konnten nicht gespeichert werden', error, true);
+    }
+  }
+
+  async updateActionHistory(actions) {
+    try {
+      const existing = await this.loadActionHistory();
+      const historyMap = new Map();
+      for (const entry of existing) {
+        const key = entry?.id || entry?.actionId || null;
+        if (key) {
+          historyMap.set(String(key), entry);
+        }
+      }
+
+      for (const action of actions || []) {
+        if (!action) {
+          continue;
+        }
+        const key = action.id || action.actionId;
+        if (!key) {
+          continue;
+        }
+        historyMap.set(String(key), { ...action, updatedAt: new Date().toISOString() });
+      }
+
+      const merged = Array.from(historyMap.values()).slice(-500);
+      await this.setStateAsync('report.actionHistory', JSON.stringify(merged, null, 2), true);
+      this.logDebug('Action history updated', { count: merged.length });
+    } catch (error) {
+      this.handleError('Aktionen-Historie konnte nicht gespeichert werden', error, true);
     }
   }
 
@@ -3478,6 +3744,7 @@ class AiAutopilot extends utils.Adapter {
     const outsideTemp = this.getOutsideTemperature(context?.live?.temperature || []);
     return {
       houseConsumption: energySummary.houseConsumption ?? null,
+      gridPower: energySummary.gridPower ?? null,
       pvPower: energySummary.pvPower ?? null,
       batterySoc: energySummary.batterySoc ?? null,
       outsideTemp,

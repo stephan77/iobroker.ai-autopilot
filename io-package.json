@@ -22,6 +22,17 @@
       "instance": "telegram.0",
       "chatId": ""
     },
+    "dailyReport": {
+      "enabled": false,
+      "time": "08:00",
+      "timezone": "",
+      "include": {
+        "summary": true,
+        "actions": true,
+        "learning": true,
+        "deviations": true
+      }
+    },
     "energy": {
       "houseConsumption": "",
       "gridPower": "",

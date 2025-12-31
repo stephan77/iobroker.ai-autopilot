@@ -64,6 +64,42 @@
         }
       }
     },
+    "dailyReport": {
+      "type": "tab",
+      "label": "Daily Report",
+      "items": {
+        "dailyReport.enabled": {
+          "type": "checkbox",
+          "label": "Tagesbericht aktivieren"
+        },
+        "dailyReport.time": {
+          "type": "text",
+          "label": "Uhrzeit (HH:mm)",
+          "help": "Zeitpunkt für den täglichen Bericht, z. B. 08:00."
+        },
+        "dailyReport.timezone": {
+          "type": "text",
+          "label": "Zeitzone (optional)",
+          "help": "Optional, z. B. Europe/Berlin. Leer = System-Zeitzone."
+        },
+        "dailyReport.include.summary": {
+          "type": "checkbox",
+          "label": "Zusammenfassung einbeziehen"
+        },
+        "dailyReport.include.actions": {
+          "type": "checkbox",
+          "label": "Aktionen einbeziehen"
+        },
+        "dailyReport.include.learning": {
+          "type": "checkbox",
+          "label": "Learning-Feedback einbeziehen"
+        },
+        "dailyReport.include.deviations": {
+          "type": "checkbox",
+          "label": "Abweichungen einbeziehen"
+        }
+      }
+    },
     "energy": {
       "type": "tab",
       "label": "Datenquellen – Energie",
