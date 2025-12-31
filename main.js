@@ -252,7 +252,6 @@ class AiAutopilot extends utils.Adapter {
     } else if (normalized === 'NEIN') {
       await this.finalizeApproval('rejected');
     } else if (normalized.startsWith('ÄNDERN')) {
-      await this.setStateAsync('memory.feedback', JSON.stringify(this.feedbackHistory, null, 2), true);
       this.log.info(`Änderungswunsch: ${feedback}`);
     }
   }
@@ -384,6 +383,7 @@ class AiAutopilot extends utils.Adapter {
   }
 
   async buildContext(liveData, aggregates) {
+    await this.loadFeedbackHistory();
     const context = {
       timestamp: new Date().toISOString(),
       mode: this.config.mode,
@@ -407,6 +407,9 @@ class AiAutopilot extends utils.Adapter {
           temperatureOutsideAvg: null
         },
         deviations: []
+      },
+      learning: {
+        feedback: this.feedbackHistory
       },
       semantics: {}
     };
@@ -1115,16 +1118,22 @@ class AiAutopilot extends utils.Adapter {
     const prompt =
       'Du bist ein Assistent für einen Haus-Autopiloten. ' +
       'Gib eine kurze, prägnante Zusammenfassung (max. 3 Sätze) mit den wichtigsten Beobachtungen ' +
-      'zu Energie-, Wasser- und Temperaturdaten. Keine Aufzählungen.\n\n' +
+      'zu Energie-, Wasser- und Temperaturdaten. Keine Aufzählungen. ' +
+      'Consider previous approved and rejected actions to adapt recommendations.\n\n' +
       JSON.stringify(
         {
-          summary: energySummary,
-          live: {
-            energy: context.live.energy,
-            water: context.live.water,
-            temperature: context.live.temperature
+          context: {
+            summary: energySummary,
+            live: {
+              energy: context.live.energy,
+              water: context.live.water,
+              temperature: context.live.temperature
+            },
+            recommendations,
+            learning: {
+              feedback: context.learning?.feedback || []
+            }
           },
-          recommendations
         },
         null,
         2
@@ -1549,7 +1558,7 @@ class AiAutopilot extends utils.Adapter {
     if (callbackData === 'modify') {
       this.awaitingTelegramInput = true;
       await this.sendTelegramMessage(
-        '✏️ Bitte sende deinen Änderungswunsch als Text. Ich speichere ihn unter memory.feedback.'
+        '✏️ Bitte sende deinen Änderungswunsch als Text. Ich speichere ihn als Feedback.'
       );
     }
   }
@@ -1557,9 +1566,9 @@ class AiAutopilot extends utils.Adapter {
   async handleTelegramText(text) {
     if (this.awaitingTelegramInput) {
       this.awaitingTelegramInput = false;
-      await this.setStateAsync('memory.feedback', text, false);
+      this.log.info(`Änderungswunsch: ${text}`);
       if (this.config.debug) {
-        this.log.info(`[DEBUG] Telegram modify text stored: ${text}`);
+        this.log.info(`[DEBUG] Telegram modify text received: ${text}`);
       }
       return;
     }
@@ -1938,9 +1947,9 @@ class AiAutopilot extends utils.Adapter {
       }
       const parsed = JSON.parse(String(existing.val));
       if (Array.isArray(parsed)) {
-        this.feedbackHistory = parsed;
+        this.feedbackHistory = parsed.slice(-50);
       } else if (parsed && typeof parsed === 'object') {
-        this.feedbackHistory = [parsed];
+        this.feedbackHistory = [parsed].slice(-50);
       } else {
         this.feedbackHistory = [];
       }
@@ -1951,37 +1960,35 @@ class AiAutopilot extends utils.Adapter {
   }
 
   buildFeedbackContext(context, energySummary) {
+    const timeLabel = new Date(context.timestamp).toLocaleTimeString('de-DE', {
+      hour: '2-digit',
+      minute: '2-digit'
+    });
+    const outsideTemp = this.getOutsideTemperature(context?.live?.temperature || []);
     return {
-      timestamp: context.timestamp,
-      mode: context.mode,
-      dryRun: context.dryRun,
-      summary: {
-        houseConsumption: energySummary.houseConsumption,
-        batterySoc: energySummary.batterySoc,
-        batteryPower: energySummary.batteryPower,
-        gridPower: energySummary.gridPower,
-        pvPower: energySummary.pvPower,
-        pvDailyEnergy: energySummary.pvDailyEnergy,
-        waterConsumption: energySummary.waterConsumption,
-        wallboxPower: energySummary.wallboxPower
-      }
+      houseConsumption: energySummary.houseConsumption ?? null,
+      pvPower: energySummary.pvPower ?? null,
+      batterySoc: energySummary.batterySoc ?? null,
+      outsideTemp,
+      timeOfDay: timeLabel
     };
   }
 
   buildFeedbackEntry(action, approvalResult, executionResult) {
+    const executed = this.wasActionExecuted(executionResult);
     return {
-      actionId: action.id,
-      approval: approvalResult,
-      executionResult,
-      context: this.lastContextSummary,
-      action: {
-        category: action.category,
-        severity: action.severity,
-        title: action.title,
-        description: action.description,
-        reason: action.reason
-      },
-      timestamp: new Date().toISOString()
+      actionId: String(action.id ?? ''),
+      category: this.normalizeFeedbackCategory(action.category),
+      decision: approvalResult === 'approved' ? 'approved' : 'rejected',
+      executed,
+      timestamp: new Date().toISOString(),
+      context: this.lastContextSummary || {
+        houseConsumption: null,
+        pvPower: null,
+        batterySoc: null,
+        outsideTemp: null,
+        timeOfDay: new Date().toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' })
+      }
     };
   }
 
@@ -1989,8 +1996,32 @@ class AiAutopilot extends utils.Adapter {
     if (!Array.isArray(entries) || entries.length === 0) {
       return;
     }
-    this.feedbackHistory = [...this.feedbackHistory, ...entries];
-    await this.setStateAsync('memory.feedback', JSON.stringify(this.feedbackHistory, null, 2), true);
+    try {
+      this.feedbackHistory = [...this.feedbackHistory, ...entries].slice(-50);
+      await this.setStateAsync('memory.feedback', JSON.stringify(this.feedbackHistory, null, 2), true);
+      if (this.config.debug) {
+        this.log.info(`[DEBUG] Feedback stored (${entries.length} entries)`);
+      }
+    } catch (error) {
+      this.log.warn(`Feedback konnte nicht gespeichert werden: ${error.message}`);
+    }
+  }
+
+  wasActionExecuted(executionResult) {
+    const status = executionResult?.status;
+    return status === 'success' || status === 'error';
+  }
+
+  normalizeFeedbackCategory(category) {
+    const normalized = String(category || '').toLowerCase();
+    const allowed = new Set(['energy', 'water', 'heating', 'pv', 'battery']);
+    if (allowed.has(normalized)) {
+      return normalized;
+    }
+    if (this.config.debug) {
+      this.log.info(`[DEBUG] Unknown feedback category "${category}", defaulting to energy`);
+    }
+    return 'energy';
   }
 
   handleError(prefix, error, soft = false) {
