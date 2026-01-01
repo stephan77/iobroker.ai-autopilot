@@ -1,0 +1,151 @@
+{
+  "i18n": true,
+  "type": "tabs",
+  "items": {
+    "general": {
+      "type": "panel",
+      "label": "Allgemein",
+      "items": {
+        "runDiscovery": {
+          "type": "button",
+          "label": "Discovery starten",
+          "command": "runDiscovery",
+          "tooltip": "Scannt Datenpunkte und speichert Kandidaten in native.discoveryCandidates"
+        },
+        "dataPoints": {
+          "type": "table",
+          "label": "Datenpunkte",
+          "items": {
+            "objectId": {
+              "type": "objectId",
+              "label": "Object ID",
+              "required": true
+            },
+            "dailyObjectId": {
+              "type": "objectId",
+              "label": "Daily Object ID",
+              "required": false
+            },
+            "category": {
+              "type": "text",
+              "label": "Kategorie",
+              "placeholder": "energy.houseConsumption"
+            },
+            "description": {
+              "type": "text",
+              "label": "Beschreibung"
+            },
+            "unit": {
+              "type": "text",
+              "label": "Einheit"
+            },
+            "enabled": {
+              "type": "checkbox",
+              "label": "Aktiv"
+            },
+            "includeInBalance": {
+              "type": "checkbox",
+              "label": "In Bilanz"
+            },
+            "isTotalMeter": {
+              "type": "checkbox",
+              "label": "Totalzähler"
+            },
+            "isSource": {
+              "type": "checkbox",
+              "label": "Quelle"
+            },
+            "isConsumer": {
+              "type": "checkbox",
+              "label": "Verbraucher"
+            },
+            "orientation": {
+              "type": "text",
+              "label": "Ausrichtung"
+            }
+          }
+        }
+      }
+    },
+    "history": {
+      "type": "panel",
+      "label": "Historie",
+      "items": {
+        "history.mode": {
+          "type": "select",
+          "label": "Modus",
+          "options": [
+            { "label": "Auto", "value": "auto" },
+            { "label": "Instanz", "value": "instance" }
+          ]
+        },
+        "history.instance": {
+          "type": "text",
+          "label": "History-Instanz",
+          "placeholder": "influxdb.0"
+        }
+      }
+    },
+    "telegram": {
+      "type": "panel",
+      "label": "Telegram",
+      "items": {
+        "telegram.enabled": {
+          "type": "checkbox",
+          "label": "Telegram aktivieren"
+        },
+        "telegram.token": {
+          "type": "text",
+          "label": "Bot Token"
+        },
+        "telegram.chatId": {
+          "type": "text",
+          "label": "Chat ID"
+        }
+      }
+    },
+    "gpt": {
+      "type": "panel",
+      "label": "GPT",
+      "items": {
+        "gpt.enabled": {
+          "type": "checkbox",
+          "label": "GPT aktivieren"
+        },
+        "gpt.openaiApiKey": {
+          "type": "password",
+          "label": "OpenAI API Key"
+        },
+        "gpt.model": {
+          "type": "text",
+          "label": "Model"
+        }
+      }
+    },
+    "scheduler": {
+      "type": "panel",
+      "label": "Scheduler",
+      "items": {
+        "scheduler.enabled": {
+          "type": "checkbox",
+          "label": "Scheduler aktivieren"
+        },
+        "scheduler.time": {
+          "type": "text",
+          "label": "Uhrzeit (UTC)",
+          "placeholder": "08:00"
+        },
+        "scheduler.days": {
+          "type": "text",
+          "label": "Tage",
+          "placeholder": "mon,tue,wed,thu,fri,sat,sun"
+        },
+        "scheduler.timezone": {
+          "type": "text",
+          "label": "Zeitzone",
+          "placeholder": "UTC"
+        }
+      }
+    }
+  }
+}

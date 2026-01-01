@@ -1,0 +1,59 @@
+{
+  "common": {
+    "name": "ai-autopilot",
+    "version": "0.0.1",
+    "news": {
+      "0.0.1": {
+        "en": "Initial version",
+        "de": "Initiale Version"
+      }
+    },
+    "titleLang": {
+      "en": "AI Autopilot",
+      "de": "AI Autopilot"
+    },
+    "desc": {
+      "en": "AI Autopilot adapter",
+      "de": "AI Autopilot Adapter"
+    },
+    "main": "main.js",
+    "icon": "ai-autopilot.png",
+    "adminUI": {
+      "config": "json"
+    },
+    "platform": "Javascript/Node.js",
+    "mode": "daemon",
+    "type": "energy",
+    "enabled": true,
+    "compact": true,
+    "connectionType": "local",
+    "dataSource": "poll",
+    "dependencies": []
+  },
+  "native": {
+    "dataPoints": [],
+    "discoveryCandidates": [],
+    "history": {
+      "mode": "auto",
+      "instance": ""
+    },
+    "telegram": {
+      "enabled": false,
+      "token": "",
+      "chatId": ""
+    },
+    "gpt": {
+      "enabled": false,
+      "openaiApiKey": "",
+      "model": "gpt-4o-mini"
+    },
+    "scheduler": {
+      "enabled": false,
+      "time": "08:00",
+      "days": "mon,tue,wed,thu,fri,sat,sun",
+      "timezone": "UTC"
+    }
+  },
+  "objects": [],
+  "instanceObjects": []
+}

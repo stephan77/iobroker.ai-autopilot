@@ -1,0 +1,23 @@
+{
+  "name": "iobroker.ai-autopilot",
+  "version": "0.0.1",
+  "description": "AI Autopilot adapter",
+  "main": "main.js",
+  "files": [
+    "admin/",
+    "lib/",
+    "main.js",
+    "io-package.json",
+    "README.md"
+  ],
+  "keywords": [
+    "iobroker",
+    "adapter",
+    "ai"
+  ],
+  "author": "ioBroker Community",
+  "license": "MIT",
+  "dependencies": {
+    "@iobroker/adapter-core": "^3.1.0"
+  }
+}
