@@ -1,7 +1,8 @@
 {
   "common": {
     "name": "ai-autopilot",
-    "version": "0.5.8",
+    "main": "main.js",
+    "version": "0.5.9",
     "mode": "daemon",
     "platform": "Javascript/Node.js",
     "icon": "ai.png",
